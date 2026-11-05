@@ -1,0 +1,113 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="760" viewBox="0 0 1200 760" role="img" aria-label="Synthetic Polymarket market screenshot for demo analysis">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0d0d10"/>
+      <stop offset="1" stop-color="#09090b"/>
+    </linearGradient>
+    <linearGradient id="area" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#38bdf8" stop-opacity="0.26"/>
+      <stop offset="1" stop-color="#38bdf8" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="yes" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#10b981"/>
+      <stop offset="1" stop-color="#059669"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="760" fill="url(#bg)"/>
+
+  <!-- top navigation -->
+  <rect x="0" y="0" width="1200" height="60" fill="#0b0b0e" stroke="#242428"/>
+  <circle cx="42" cy="30" r="12" fill="#2563eb"/>
+  <path d="M36 31l4-7 4 4 4-6" stroke="#fff" stroke-width="2" fill="none" stroke-linecap="round"/>
+  <text x="64" y="35" fill="#f4f4f5" font-family="Inter, -apple-system, sans-serif" font-size="17" font-weight="700">Polymarket</text>
+  <text x="185" y="35" fill="#8b8b94" font-family="Inter, -apple-system, sans-serif" font-size="13">Markets</text>
+  <text x="256" y="35" fill="#8b8b94" font-family="Inter, -apple-system, sans-serif" font-size="13">Activity</text>
+  <text x="330" y="35" fill="#8b8b94" font-family="Inter, -apple-system, sans-serif" font-size="13">Portfolio</text>
+  <rect x="1010" y="16" width="150" height="28" rx="14" fill="#17171b" stroke="#2c2c32"/>
+  <text x="1085" y="35" fill="#d4d4d8" font-family="Inter, -apple-system, sans-serif" font-size="12" text-anchor="middle">Sign in · $0.00</text>
+
+  <!-- market card -->
+  <rect x="60" y="88" width="1080" height="612" rx="18" fill="#111114" stroke="#26262b"/>
+  <text x="84" y="84" fill="#71717a" font-family="Inter, -apple-system, sans-serif" font-size="11">Crypto / Bitcoin</text>
+
+  <!-- title region -->
+  <text x="84" y="128" fill="#f4f4f5" font-family="Inter, -apple-system, sans-serif" font-size="29" font-weight="600">Will Bitcoin exceed $100,000 on Binance</text>
+  <text x="84" y="162" fill="#f4f4f5" font-family="Inter, -apple-system, sans-serif" font-size="29" font-weight="600">by Nov 15, 2026?</text>
+
+  <!-- meta chips -->
+  <rect x="84" y="185" width="116" height="24" rx="12" fill="#1c1c21" stroke="#2c2c32"/>
+  <text x="142" y="201" fill="#a1a1aa" font-family="Inter, -apple-system, sans-serif" font-size="11" text-anchor="middle">Crypto</text>
+  <rect x="208" y="185" width="150" height="24" rx="12" fill="#1c1c21" stroke="#2c2c32"/>
+  <text x="283" y="201" fill="#a1a1aa" font-family="Inter, -apple-system, sans-serif" font-size="11" text-anchor="middle">$1.2M volume</text>
+  <rect x="366" y="185" width="128" height="24" rx="12" fill="#1c1c21" stroke="#2c2c32"/>
+  <text x="430" y="201" fill="#a1a1aa" font-family="Inter, -apple-system, sans-serif" font-size="11" text-anchor="middle">Ends Nov 15</text>
+
+  <!-- chart panel -->
+  <rect x="84" y="232" width="620" height="220" rx="12" fill="#0d0d10" stroke="#242428"/>
+  <path d="M104 390 L154 372 L204 380 L254 350 L304 356 L354 326 L404 334 L454 300 L504 308 L554 276 L604 284 L654 262 L684 250" fill="none" stroke="#38bdf8" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M104 390 L154 372 L204 380 L254 350 L304 356 L354 326 L404 334 L454 300 L504 308 L554 276 L604 284 L654 262 L684 250 L684 424 L104 424 Z" fill="url(#area)"/>
+  <circle cx="684" cy="250" r="4" fill="#0d0d10" stroke="#38bdf8" stroke-width="2"/>
+  <text x="104" y="258" fill="#71717a" font-family="Inter, -apple-system, sans-serif" font-size="10">IMPLIED PROBABILITY</text>
+  <text x="104" y="286" fill="#f4f4f5" font-family="ui-monospace, monospace" font-size="24" font-weight="600">64%</text>
+  <text x="104" y="303" fill="#34d399" font-family="ui-monospace, monospace" font-size="10">+3.2% today</text>
+  <g fill="#52525b" font-family="ui-monospace, monospace" font-size="9">
+    <text x="104" y="444">Oct 18</text>
+    <text x="364" y="444">Oct 28</text>
+    <text x="634" y="444">Nov 4</text>
+  </g>
+
+  <!-- expiry region -->
+  <rect x="768" y="232" width="348" height="52" rx="10" fill="#17171b" stroke="#2c2c32"/>
+  <text x="786" y="253" fill="#71717a" font-family="Inter, -apple-system, sans-serif" font-size="10">MARKET ENDS</text>
+  <text x="786" y="272" fill="#e4e4e7" font-family="ui-monospace, monospace" font-size="13">Nov 15, 2026 · 23:59 UTC</text>
+
+  <!-- resolution region -->
+  <rect x="768" y="300" width="348" height="152" rx="10" fill="#17171b" stroke="#2c2c32"/>
+  <text x="786" y="322" fill="#71717a" font-family="Inter, -apple-system, sans-serif" font-size="10">RESOLUTION RULES</text>
+  <text x="786" y="344" fill="#c4c4c8" font-family="Inter, -apple-system, sans-serif" font-size="11">Resolves YES if the Binance BTC/USDT</text>
+  <text x="786" y="361" fill="#c4c4c8" font-family="Inter, -apple-system, sans-serif" font-size="11">1-minute candle close is strictly above</text>
+  <text x="786" y="378" fill="#c4c4c8" font-family="Inter, -apple-system, sans-serif" font-size="11">$100,000.00 at 23:59:59 UTC.</text>
+  <text x="786" y="403" fill="#71717a" font-family="Inter, -apple-system, sans-serif" font-size="10">Resolution source</text>
+  <text x="786" y="420" fill="#d4d4d8" font-family="Inter, -apple-system, sans-serif" font-size="11">Binance Spot · BTC/USDT</text>
+  <rect x="786" y="430" width="70" height="14" rx="7" fill="#1e3a5f"/>
+  <text x="821" y="440" fill="#7dd3fc" font-family="Inter, -apple-system, sans-serif" font-size="8" text-anchor="middle">VERIFIED</text>
+
+  <!-- prices -->
+  <text x="84" y="490" fill="#71717a" font-family="Inter, -apple-system, sans-serif" font-size="10">BUY OUTCOME</text>
+
+  <rect x="84" y="502" width="168" height="74" rx="12" fill="#0f2e24" stroke="#10b981"/>
+  <text x="104" y="528" fill="#6ee7b7" font-family="Inter, -apple-system, sans-serif" font-size="12" font-weight="600">YES</text>
+  <text x="104" y="558" fill="#f4f4f5" font-family="ui-monospace, monospace" font-size="22" font-weight="600">62¢</text>
+  <text x="232" y="558" fill="#6ee7b7" font-family="ui-monospace, monospace" font-size="10" text-anchor="end">64%</text>
+
+  <rect x="264" y="502" width="168" height="74" rx="12" fill="#2d1419" stroke="#f43f5e"/>
+  <text x="284" y="528" fill="#fda4af" font-family="Inter, -apple-system, sans-serif" font-size="12" font-weight="600">NO</text>
+  <text x="284" y="558" fill="#f4f4f5" font-family="ui-monospace, monospace" font-size="22" font-weight="600">40¢</text>
+  <text x="412" y="558" fill="#fda4af" font-family="ui-monospace, monospace" font-size="10" text-anchor="end">36%</text>
+
+  <!-- order book -->
+  <rect x="84" y="596" width="620" height="76" rx="10" fill="#0d0d10" stroke="#242428"/>
+  <text x="104" y="618" fill="#71717a" font-family="Inter, -apple-system, sans-serif" font-size="10">ORDER BOOK · TOP OF BOOK</text>
+  <text x="104" y="640" fill="#34d399" font-family="ui-monospace, monospace" font-size="11">BID 60.0¢ · 18,420 shares</text>
+  <text x="104" y="658" fill="#fb7185" font-family="ui-monospace, monospace" font-size="11">ASK 62.0¢ · 12,960 shares</text>
+  <text x="684" y="640" fill="#a1a1aa" font-family="ui-monospace, monospace" font-size="10" text-anchor="end">Spread 2.0%</text>
+  <text x="684" y="658" fill="#a1a1aa" font-family="ui-monospace, monospace" font-size="10" text-anchor="end">Liquidity $184.2K</text>
+
+  <!-- side stats -->
+  <rect x="768" y="468" width="348" height="204" rx="12" fill="#0d0d10" stroke="#242428"/>
+  <text x="786" y="492" fill="#71717a" font-family="Inter, -apple-system, sans-serif" font-size="10">MARKET STATISTICS</text>
+  <text x="786" y="520" fill="#a1a1aa" font-family="Inter, -apple-system, sans-serif" font-size="11">24h volume</text>
+  <text x="1098" y="520" fill="#e4e4e7" font-family="ui-monospace, monospace" font-size="11" text-anchor="end">$642,800</text>
+  <text x="786" y="546" fill="#a1a1aa" font-family="Inter, -apple-system, sans-serif" font-size="11">Total liquidity</text>
+  <text x="1098" y="546" fill="#e4e4e7" font-family="ui-monospace, monospace" font-size="11" text-anchor="end">$184,200</text>
+  <text x="786" y="572" fill="#a1a1aa" font-family="Inter, -apple-system, sans-serif" font-size="11">Best bid / ask</text>
+  <text x="1098" y="572" fill="#e4e4e7" font-family="ui-monospace, monospace" font-size="11" text-anchor="end">60.0¢ / 62.0¢</text>
+  <text x="786" y="598" fill="#a1a1aa" font-family="Inter, -apple-system, sans-serif" font-size="11">Open interest</text>
+  <text x="1098" y="598" fill="#e4e4e7" font-family="ui-monospace, monospace" font-size="11" text-anchor="end">$1.08M</text>
+  <rect x="786" y="620" width="312" height="1" fill="#242428"/>
+  <text x="786" y="644" fill="#71717a" font-family="Inter, -apple-system, sans-serif" font-size="10">Last verified against Gamma + CLOB</text>
+  <text x="786" y="660" fill="#7dd3fc" font-family="ui-monospace, monospace" font-size="10">2026-11-04 14:28:05 UTC</text>
+
+  <!-- footer watermark -->
+  <text x="600" y="730" fill="#3f3f46" font-family="ui-monospace, monospace" font-size="9" text-anchor="middle">SYNTHETIC DEMO SCREENSHOT · NOT A LIVE POLYMARKET PAGE · vector</text>
+</svg>

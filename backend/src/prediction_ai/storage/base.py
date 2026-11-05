@@ -1,0 +1,13 @@
+from typing import Protocol
+
+
+class StorageBackend(Protocol):
+    """Private object storage abstraction for uploaded screenshots."""
+
+    async def put(self, key: str, data: bytes, content_type: str) -> None: ...
+
+    async def get(self, key: str) -> bytes: ...
+
+    async def delete(self, key: str) -> None: ...
+
+    async def health(self) -> bool: ...
