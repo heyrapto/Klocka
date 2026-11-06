@@ -1,3 +1,4 @@
+from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -16,6 +17,26 @@ def test_gemini_response_schema_contains_only_provider_safe_keys():
     assert "additional_properties" not in serialized
     assert "$ref" not in serialized
     assert "$defs" not in serialized
+
+
+def test_screenshot_candidate_normalizes_zero_for_missing_price_fields():
+    candidate = ScreenshotMarketCandidate.model_validate(
+        {
+            "platform": "bayse",
+            "market_title": "When Will Michael Carrick Leave Manchester United?",
+            "category": "sports",
+            "target_price": 0.0,
+            "displayed_underlying_price": 0.0,
+            "outcomes": [
+                {"label": "Yes", "displayed_price": 0.74, "text_confidence": 0.95},
+                {"label": "No", "displayed_price": 0.32, "text_confidence": 0.95},
+            ],
+        }
+    )
+
+    assert candidate.target_price is None
+    assert candidate.displayed_underlying_price is None
+    assert candidate.outcomes[0].displayed_price == Decimal("0.74")
 
 
 @pytest.mark.asyncio

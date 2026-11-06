@@ -100,3 +100,41 @@ async def test_feedback_learning_loop():
         learnings = await sqlite.get_recent_learnings(category="crypto", limit=5)
         assert len(learnings) >= 1
         assert learnings[0]["was_correct"] is True
+
+
+@pytest.mark.asyncio
+async def test_sse_stream_includes_stage_in_payload():
+    """Regression: SSE data payloads must carry ``stage`` so client progress bars track pipeline steps."""
+    import json as json_lib
+
+    from prediction_ai.db.sqlite import get_sqlite_db
+
+    sqlite = get_sqlite_db()
+    analysis_id = uuid4()
+    await sqlite.create_analysis({
+        "analysis_id": str(analysis_id),
+        "status": "COMPLETED",  # terminal status ends the SSE loop after draining queued events
+    })
+    await sqlite.append_analysis_event(
+        str(analysis_id),
+        {
+            "sequence_number": 1,
+            "event_type": "analysis.stage",
+            "stage": "DATA_COLLECTION",
+            "payload": {"status": "in_progress", "message": "Ingesting real-time order book data"},
+        },
+    )
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        res = await client.get(f"/api/v1/analyses/{analysis_id}/events")
+        assert res.status_code == 200
+        stage_frames = []
+        for block in res.text.split("\n\n"):
+            lines = [ln for ln in block.split("\n") if ln.startswith("data: ")]
+            if any(ln.strip() == "event: analysis.stage" for ln in block.split("\n")) and lines:
+                stage_frames.extend(json_lib.loads(ln[len("data: "):]) for ln in lines)
+        assert stage_frames, "expected at least one analysis.stage SSE frame"
+        for payload in stage_frames:
+            assert payload["stage"] == "DATA_COLLECTION"
+            assert payload["message"] == "Ingesting real-time order book data"

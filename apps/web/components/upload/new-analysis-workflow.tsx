@@ -152,7 +152,13 @@ export function NewAnalysisWorkflow() {
   const running = state === "uploading" || state === "streaming";
   const activeStage = stages.find((row) => row.status === "in_progress" || row.status === "failed");
   const completedCount = stages.filter((row) => row.status === "completed").length;
-  const progress = Math.round((completedCount / stages.length) * 100);
+  const activeStageIndex = activeStage ? stages.indexOf(activeStage) : -1;
+  const progress =
+    state === "completed"
+      ? 100
+      : activeStageIndex >= 0
+        ? Math.round(((activeStageIndex + 1) / stages.length) * 100)
+        : Math.round((completedCount / stages.length) * 100);
 
   function acceptFile(next: File) {
     setFileError(null);
@@ -492,7 +498,7 @@ export function NewAnalysisWorkflow() {
           <PanelHeader
             eyebrow="Step 01"
             title="Screenshot"
-            description="Upload a Polymarket or Bayse market page. Prices are read for identification only and are never trusted as executable quotes."
+            description="Upload a market screenshot. Prices are used for identification only and are never treated as live quotes."
             actions={<Badge tone="neutral">PNG · JPEG · WebP</Badge>}
             icon={<FileImage className="size-3.5" />}
           />
@@ -651,7 +657,7 @@ export function NewAnalysisWorkflow() {
           <PanelHeader
             eyebrow="Step 03"
             title="Optional context"
-            description="Add a market slug or URL if the screenshot is cropped. Context is advisory; verification still uses official APIs."
+            description="Add a market link if the screenshot is cropped. Context is advisory; the contract is verified before analysis."
             icon={<ScanLine className="size-3.5" />}
           />
           <PanelBody>
@@ -840,7 +846,7 @@ export function NewAnalysisWorkflow() {
           />
           <ul className="divide-y divide-line/50">
             {[
-              { title: "Verified contracts only", detail: "Critical resolution fields must match the official platform API." },
+              { title: "Verified contracts only", detail: "Critical resolution fields must match the live market record." },
               { title: "Point-in-time evidence", detail: "Research published after the forecast cutoff is never retrieved." },
               { title: "Cost-aware abstention", detail: "Fees, spread, and slippage are deducted before any edge is reported." },
               { title: "No execution", detail: "The platform never signs orders, holds keys, or moves funds." },

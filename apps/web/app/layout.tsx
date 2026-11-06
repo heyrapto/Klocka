@@ -1,28 +1,42 @@
 import type { Metadata, Viewport } from "next";
+import { DM_Sans, Instrument_Serif } from "next/font/google";
 
 import "./globals.css";
 
+const dmSans = DM_Sans({
+  subsets: ["latin"],
+  weight: ["400", "500", "600", "700"],
+  variable: "--font-dm-sans",
+  display: "swap",
+});
+
+const instrumentSerif = Instrument_Serif({
+  subsets: ["latin"],
+  weight: "400",
+  style: ["normal", "italic"],
+  variable: "--font-instrument-serif",
+  display: "swap",
+});
+
 export const metadata: Metadata = {
   title: {
-    default: "Vector · Prediction Intelligence",
-    template: "%s · Vector",
+    default: "Klocka · Prediction Intelligence",
+    template: "%s · Klocka",
   },
   description:
     "Verified-market probabilistic intelligence. Screenshot analysis, calibrated forecasts, and disciplined abstention for prediction markets.",
-  applicationName: "Vector",
+  applicationName: "Klocka",
   keywords: [
     "prediction markets",
     "calibrated forecasting",
-    "Polymarket",
-    "Bayse",
     "decision intelligence",
   ],
   robots: { index: false, follow: false },
 };
 
 export const viewport: Viewport = {
-  themeColor: "#09090b",
-  colorScheme: "dark",
+  themeColor: "#f7f7f5",
+  colorScheme: "light",
   width: "device-width",
   initialScale: 1,
 };
@@ -33,9 +47,9 @@ export default function RootLayout({
   return (
     <html
       lang="en"
-      className="h-full antialiased font-sans"
+      className={`${dmSans.variable} ${instrumentSerif.variable} h-full antialiased font-sans`}
     >
-      <body className="min-h-full bg-canvas text-zinc-100">{children}</body>
+      <body className="min-h-full bg-canvas text-zinc-900">{children}</body>
     </html>
   );
 }

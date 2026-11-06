@@ -55,7 +55,7 @@ export function AppShell({
         </main>
         <footer className="mx-auto flex w-full max-w-[1560px] flex-wrap items-center justify-between gap-2 border-t border-line/60 px-4 py-4 text-[10px] text-zinc-600 sm:px-6 lg:px-8">
           <span>
-            Vector · Analysis and decision support only. No order execution, custody, or guaranteed returns.
+            Klocka · Analysis and decision support only. No order execution, custody, or guaranteed returns.
           </span>
           <span className="mono">DEMO · fixtures 2026-11-04 · policy ev_policy_v1.2.0</span>
         </footer>

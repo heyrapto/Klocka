@@ -116,6 +116,21 @@ class SQLiteStore:
                 created_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_feedback_category ON feedback(category, created_at);
+
+            CREATE TABLE IF NOT EXISTS asset_calibration (
+                symbol TEXT NOT NULL,
+                category TEXT NOT NULL DEFAULT 'crypto',
+                sample_count INTEGER NOT NULL DEFAULT 0,
+                correct_count INTEGER NOT NULL DEFAULT 0,
+                brier_score REAL NOT NULL DEFAULT 0.25,
+                vol_multiplier REAL NOT NULL DEFAULT 1.0,
+                momentum_weight REAL NOT NULL DEFAULT 0.35,
+                order_flow_weight REAL NOT NULL DEFAULT 0.30,
+                uncertainty_margin REAL NOT NULL DEFAULT 0.02,
+                last_discrepancy_reason TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (symbol, category)
+            );
             """)
         self._initialized = True
         logger.info("SQLite database initialized successfully", db_path=self.db_path)
@@ -453,6 +468,108 @@ class SQLiteStore:
 
     async def get_recent_learnings(self, category: str | None = None, limit: int = 5) -> list[dict[str, Any]]:
         return await anyio.to_thread.run_sync(self._get_recent_learnings_sync, category, limit)
+
+    def _get_asset_calibration_sync(self, symbol: str, category: str = "crypto") -> dict[str, Any]:
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                "SELECT * FROM asset_calibration WHERE symbol = ? AND category = ?",
+                (symbol.upper(), category.lower()),
+            )
+            row = cursor.fetchone()
+            if row:
+                return dict(row)
+            # Default calibration baseline
+            return {
+                "symbol": symbol.upper(),
+                "category": category.lower(),
+                "sample_count": 0,
+                "correct_count": 0,
+                "brier_score": 0.25,
+                "vol_multiplier": 1.0,
+                "momentum_weight": 0.35,
+                "order_flow_weight": 0.30,
+                "uncertainty_margin": 0.02,
+                "last_discrepancy_reason": None,
+                "updated_at": datetime.now(UTC).isoformat(),
+            }
+
+    async def get_asset_calibration(self, symbol: str, category: str = "crypto") -> dict[str, Any]:
+        return await anyio.to_thread.run_sync(self._get_asset_calibration_sync, symbol, category)
+
+    def _update_asset_calibration_sync(
+        self,
+        symbol: str,
+        category: str,
+        was_correct: bool,
+        brier_loss: float,
+        vol_multiplier_delta: float = 0.0,
+        momentum_weight_delta: float = 0.0,
+        order_flow_weight_delta: float = 0.0,
+        uncertainty_margin_delta: float = 0.0,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        sym = symbol.upper()
+        cat = category.lower()
+        now = datetime.now(UTC).isoformat()
+        current = self._get_asset_calibration_sync(sym, cat)
+
+        n = current["sample_count"] + 1
+        corrects = current["correct_count"] + (1 if was_correct else 0)
+        # Exponential moving average for Brier score (alpha = 0.2)
+        alpha = 0.2 if current["sample_count"] > 0 else 1.0
+        new_brier = (1.0 - alpha) * current["brier_score"] + alpha * brier_loss
+
+        # Bounded weight updates
+        new_vol = max(0.5, min(2.0, current["vol_multiplier"] + vol_multiplier_delta))
+        new_momentum = max(0.10, min(0.60, current["momentum_weight"] + momentum_weight_delta))
+        new_order_flow = max(0.10, min(0.60, current["order_flow_weight"] + order_flow_weight_delta))
+        new_uncertainty = max(0.01, min(0.08, current["uncertainty_margin"] + uncertainty_margin_delta))
+
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO asset_calibration (
+                    symbol, category, sample_count, correct_count, brier_score,
+                    vol_multiplier, momentum_weight, order_flow_weight, uncertainty_margin,
+                    last_discrepancy_reason, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(symbol, category) DO UPDATE SET
+                    sample_count = excluded.sample_count,
+                    correct_count = excluded.correct_count,
+                    brier_score = excluded.brier_score,
+                    vol_multiplier = excluded.vol_multiplier,
+                    momentum_weight = excluded.momentum_weight,
+                    order_flow_weight = excluded.order_flow_weight,
+                    uncertainty_margin = excluded.uncertainty_margin,
+                    last_discrepancy_reason = excluded.last_discrepancy_reason,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    sym, cat, n, corrects, new_brier,
+                    new_vol, new_momentum, new_order_flow, new_uncertainty,
+                    reason, now,
+                ),
+            )
+        return self._get_asset_calibration_sync(sym, cat)
+
+    async def update_asset_calibration(
+        self,
+        symbol: str,
+        category: str,
+        was_correct: bool,
+        brier_loss: float,
+        vol_multiplier_delta: float = 0.0,
+        momentum_weight_delta: float = 0.0,
+        order_flow_weight_delta: float = 0.0,
+        uncertainty_margin_delta: float = 0.0,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        return await anyio.to_thread.run_sync(
+            self._update_asset_calibration_sync,
+            symbol, category, was_correct, brier_loss,
+            vol_multiplier_delta, momentum_weight_delta,
+            order_flow_weight_delta, uncertainty_margin_delta, reason,
+        )
 
 
 _sqlite_store: SQLiteStore | None = None

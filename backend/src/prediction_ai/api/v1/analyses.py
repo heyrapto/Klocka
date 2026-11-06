@@ -393,7 +393,11 @@ async def stream_analysis_events(
 
             for ev in new_events:
                 last_seq = ev.get("sequence_number", last_seq + 1)
-                yield format_sse_message(ev.get("event_type", "analysis.stage"), ev.get("payload", {}), last_seq)
+                # Merge the stage into the streamed data so SSE clients can map
+                # progress; "stage" is stored as a sibling of "payload" in the
+                # durable event record and would otherwise never reach clients.
+                event_data = {**ev.get("payload", {}), "stage": ev.get("stage", "STAGE")}
+                yield format_sse_message(ev.get("event_type", "analysis.stage"), event_data, last_seq)
 
             if doc.get("status") in TERMINAL_STATUSES:
                 break
@@ -455,54 +459,85 @@ async def confirm_market(
 @router.post("/{analysis_id}/feedback", status_code=status.HTTP_200_OK, response_model=AnalysisFeedbackResponse)
 async def submit_analysis_feedback(
     analysis_id: UUID,
-    payload: AnalysisFeedbackRequest,
+    request: Request,
     current_user: AuthenticatedUser = Depends(get_current_user),
     sqlite: SQLiteStore = Depends(get_sqlite),
     settings: Settings = Depends(get_settings),
 ) -> AnalysisFeedbackResponse:
-    """Submit post-settlement trade feedback for continuous learning and self-improvement."""
+    """Submit post-settlement trade feedback with optional settlement screenshot for multimodal self-improvement."""
     doc = await sqlite.get_analysis(str(analysis_id))
     if doc is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Analysis not found")
+
+    content_type = request.headers.get("content-type", "")
+    settlement_file_bytes: bytes | None = None
+    settlement_file_mime: str = "image/jpeg"
+
+    if content_type.startswith("multipart/form-data"):
+        form = await request.form()
+        actual_outcome = str(form.get("actual_outcome", "YES")).upper()
+        settled_price_raw = form.get("settled_price")
+        settled_price = Decimal(str(settled_price_raw)) if settled_price_raw else None
+        notes = str(form.get("notes")) if form.get("notes") else None
+        file_field = form.get("file")
+        if file_field and hasattr(file_field, "read"):
+            settlement_file_bytes = await file_field.read()
+            settlement_file_mime = getattr(file_field, "content_type", "image/jpeg") or "image/jpeg"
+    else:
+        body = await request.json()
+        payload = AnalysisFeedbackRequest.model_validate(body)
+        actual_outcome = payload.actual_outcome
+        settled_price = payload.settled_price
+        notes = payload.notes
 
     forecast_doc = doc.get("forecast") or {}
     recommendation = forecast_doc.get("recommendation", "NO_TRADE")
     market_data = forecast_doc.get("market") or {}
     market_title = market_data.get("title") or "Unknown Market"
     category = market_data.get("category") or "crypto"
-
-    # Evaluate whether prediction was correct
-    if recommendation == "BUY_YES":
-        was_correct = (payload.actual_outcome == "YES")
-    elif recommendation == "BUY_NO":
-        was_correct = (payload.actual_outcome == "NO")
-    else:  # NO_TRADE (prudent abstention)
-        was_correct = True
-
+    symbol = market_data.get("underlying_symbol") or "BTC"
     prob_yes = float(forecast_doc.get("probability_yes", 0.5))
     prediction_made = f"{recommendation} (P(YES)={prob_yes:.2f})"
 
-    if was_correct:
-        postmortem_analysis = (
-            f"Prediction successfully aligned with market resolution ({payload.actual_outcome}). "
-            f"Confluence of order book momentum and specialist intervals validated."
-        )
-        key_learnings = [
-            f"Validation successful on {category.upper()}: order book momentum and interval depth accurately indicated outcome.",
-            "Preserve conservative Kelly sizing discipline and minimum net edge threshold.",
-        ]
-    else:
-        postmortem_analysis = (
-            f"Prediction discrepancy identified: recommended {recommendation} but market settled as {payload.actual_outcome}. "
-            f"Likely driven by late interval volatility, tail news event, or order book liquidity evaporation."
-        )
-        key_learnings = [
-            f"For future {category.upper()} intervals, increase penalty on thin spread liquidity near resolution.",
-            "Expand uncertainty interval width when conflicting order flow or cross-venue price divergence appears.",
-        ]
+    # Run Causal Diagnostic Postmortem Agent (with multimodal screenshot inspection)
+    from prediction_ai.learning.postmortem_agent import run_postmortem_analysis
 
-    if payload.notes:
-        postmortem_analysis += f" User observation: {payload.notes}"
+    specialist_context = doc.get("specialist_context") or forecast_doc.get("specialist_context")
+    extraction_res = doc.get("extraction_result") or {}
+    strike_price = float(extraction_res.get("target_price")) if extraction_res.get("target_price") else None
+
+    postmortem = await run_postmortem_analysis(
+        market_title=market_title,
+        category=category,
+        symbol=symbol,
+        recommendation=recommendation,
+        probability_yes=prob_yes,
+        actual_outcome=actual_outcome,
+        settled_price=float(settled_price) if settled_price is not None else None,
+        strike_price=strike_price,
+        user_notes=notes,
+        specialist_context=specialist_context,
+        settlement_image_bytes=settlement_file_bytes,
+        settlement_image_mime=settlement_file_mime,
+        settings=settings,
+    )
+
+    was_correct = postmortem.was_correct
+    postmortem_analysis = postmortem.postmortem_analysis
+    key_learnings = postmortem.key_learnings
+
+    # Recalibrate persistent SQLite Knowledge Matrix for this asset
+    await sqlite.update_asset_calibration(
+        symbol=symbol,
+        category=category,
+        was_correct=was_correct,
+        brier_loss=postmortem.brier_loss,
+        vol_multiplier_delta=postmortem.vol_multiplier_delta,
+        momentum_weight_delta=postmortem.momentum_weight_delta,
+        order_flow_weight_delta=postmortem.order_flow_weight_delta,
+        uncertainty_margin_delta=postmortem.uncertainty_margin_delta,
+        reason=postmortem.discrepancy_classification,
+    )
 
     feedback_id = uuid4()
     now_dt = datetime.now(UTC)
@@ -514,12 +549,16 @@ async def submit_analysis_feedback(
         "category": category,
         "market_title": market_title,
         "recommendation": recommendation,
-        "actual_outcome": payload.actual_outcome,
+        "actual_outcome": actual_outcome,
         "was_correct": was_correct,
-        "settled_price": float(payload.settled_price) if payload.settled_price is not None else None,
-        "user_notes": payload.notes,
+        "settled_price": float(settled_price) if settled_price is not None else None,
+        "user_notes": notes,
         "postmortem_analysis": postmortem_analysis,
+        "visual_observations": postmortem.visual_observations,
         "key_learnings": key_learnings,
+        "discrepancy_classification": postmortem.discrepancy_classification,
+        "brier_loss": postmortem.brier_loss,
+        "has_settlement_screenshot": bool(settlement_file_bytes),
         "created_at": now_dt.isoformat(),
     }
     await sqlite.record_feedback(feedback_doc)
@@ -529,16 +568,19 @@ async def submit_analysis_feedback(
         analysis_id=str(analysis_id),
         was_correct=was_correct,
         recommendation=recommendation,
-        actual_outcome=payload.actual_outcome,
+        actual_outcome=actual_outcome,
+        has_screenshot=bool(settlement_file_bytes),
     )
 
     return AnalysisFeedbackResponse(
         feedback_id=feedback_id,
         analysis_id=analysis_id,
-        actual_outcome=payload.actual_outcome,
+        actual_outcome=actual_outcome,
         was_correct=was_correct,
         prediction_made=prediction_made,
         postmortem_analysis=postmortem_analysis,
+        visual_observations=postmortem.visual_observations,
+        discrepancy_classification=postmortem.discrepancy_classification,
         key_learnings=key_learnings,
         created_at=now_dt,
     )

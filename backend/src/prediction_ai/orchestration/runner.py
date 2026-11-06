@@ -89,7 +89,8 @@ class AnalysisWorkflowRunner:
         recorder: EventRecorder,
         client: httpx.AsyncClient,
     ) -> None:
-        logger.info("Starting pipeline execution", analysis_id=str(analysis_id))
+        workflow_started_at = datetime.now(UTC)
+        logger.info("Starting pipeline execution", analysis_id=str(analysis_id), started_at=workflow_started_at.isoformat())
         sqlite = get_sqlite_db()
         mongo = get_mongo_db()
 
@@ -418,18 +419,30 @@ class AnalysisWorkflowRunner:
         )
 
         specialist_service = SpecialistResearchService(http_client=client)
-        time_to_close: float | None = None
+        from prediction_ai.specialists.crypto.time_tracking import resolve_market_timing
+
+        timing_ctx = resolve_market_timing(
+            workflow_started_at=workflow_started_at,
+            countdown_text=candidate.countdown_text,
+            displayed_expiry=candidate.displayed_expiry,
+            market_closes_at=best_market.closes_at,
+        )
+        if best_market.resolves_at is None:
+            best_market.resolves_at = timing_ctx.exact_resolves_at
+        if best_market.closes_at is None:
+            best_market.closes_at = timing_ctx.exact_resolves_at
+
+        time_to_close = timing_ctx.decision_seconds_remaining
         forecast_cutoff = datetime.now(UTC)
-        if best_market.closes_at:
-            delta = (best_market.closes_at - forecast_cutoff).total_seconds()
-            time_to_close = max(0.0, delta)
 
         category = best_market.category if best_market.category and best_market.category != "unknown" else "crypto"
+        target_price_float = float(candidate.target_price) if candidate.target_price is not None else None
         specialist_context = await specialist_service.gather_context(
             category=category,
             asset=best_market.underlying_symbol or candidate.asset_or_entity,
             title=best_market.title,
             time_to_close_seconds=time_to_close,
+            target_price=target_price_float,
         )
 
         screenshot_observation = candidate.model_dump(
@@ -524,10 +537,18 @@ class AnalysisWorkflowRunner:
         ask_yes = Decimal("0.50")
         ask_no = Decimal("0.50")
         for q in order_book.quotes:
-            if q.label.lower() in ("yes", "yes ") and q.best_ask is not None:
+            label = q.label.strip().lower()
+            if label in ("yes", "up", "higher", "over") and q.best_ask is not None:
                 ask_yes = q.best_ask
-            elif q.label.lower() in ("no", "no ") and q.best_ask is not None:
+            elif label in ("no", "down", "lower", "under") and q.best_ask is not None:
                 ask_no = q.best_ask
+
+        # If quotes are a binary pair that didn't match the standard labels, map index 0 to YES and 1 to NO
+        if ask_yes == Decimal("0.50") and ask_no == Decimal("0.50") and len(order_book.quotes) == 2:
+            if order_book.quotes[0].best_ask is not None:
+                ask_yes = order_book.quotes[0].best_ask
+            if order_book.quotes[1].best_ask is not None:
+                ask_no = order_book.quotes[1].best_ask
 
         decision = evaluate_decision(
             probability_yes=forecast_result.probability_yes,
@@ -568,6 +589,7 @@ class AnalysisWorkflowRunner:
             "evidence": [ev.model_dump(mode="json") for ev in forecast_result.evidence],
             "market": best_market.model_dump(mode="json"),
             "specialist_context": specialist_context,
+            "timing_provenance": timing_ctx.to_dict(),
         }
 
         # 1. Save to SQLite

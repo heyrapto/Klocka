@@ -70,36 +70,27 @@ def _clean_json_text(text: str) -> str:
 def _assert_extraction_quality(candidate: ScreenshotMarketCandidate) -> None:
     """Raise ExtractionFailedException when mandatory market fields are missing.
 
-    Gemini must return at minimum:
-    - A non-empty market title or asset identifier.
-    - At least one outcome with a price or probability present.
-
-    If neither is satisfied the response is rejected early so the pipeline
-    never proceeds with an empty candidate — the caller must surface this
-    as a retriable extraction error rather than silently producing a bad
-    forecast.
+    Gemini must return at minimum a non-empty market title or asset identifier.
+    Buttons and token prices are optional: the platform API (Polymarket CLOB or
+    Bayse API) cross-verifies the market and retrieves live, executable order-book
+    quotes directly. Never fail an extraction simply because the crop omitted the
+    order buttons or prices.
     """
     if not (candidate.market_title or candidate.asset_or_entity):
         raise ExtractionFailedException(
             "Gemini extraction incomplete: no market title or asset identifier found in the screenshot. "
-            "Ensure the screenshot shows a prediction market contract with a visible question or asset label."
+            "Ensure the screenshot shows a prediction market contract with a visible question, title, or asset label."
         )
 
-    prices_found = any(
-        o.displayed_price is not None or o.displayed_probability is not None
-        for o in candidate.outcomes
-    )
+    # If outcomes were not visible in the screenshot, populate default binary labels
+    # so downstream models always have an outcome structure to evaluate.
     if not candidate.outcomes:
-        raise ExtractionFailedException(
-            "Gemini extraction incomplete: no outcome labels or prices were read from the screenshot. "
-            "The screenshot must show at least one tradeable outcome (e.g. 'Buy Up ₦58' / 'Buy Down ₦45')."
-        )
-    if not prices_found:
-        raise ExtractionFailedException(
-            f"Gemini extraction incomplete: {len(candidate.outcomes)} outcome(s) found but none carry "
-            "a price or probability. Verify that the screenshot shows executable token prices "
-            "(e.g. 'Buy Up ₦58' on Bayse, or a YES/NO price on Polymarket)."
-        )
+        from prediction_ai.schemas.analysis import ExtractedOutcome
+
+        candidate.outcomes = [
+            ExtractedOutcome(label="YES", text_confidence=0.8),
+            ExtractedOutcome(label="NO", text_confidence=0.8),
+        ]
 
 
 # ---------------------------------------------------------------------------

@@ -2,6 +2,7 @@
 
 import React, { useEffect, useRef, useState } from "react";
 import Image from "next/image";
+import Link from "next/link";
 import {
   AlertTriangle,
   ArrowLeft,
@@ -16,6 +17,7 @@ import {
   Upload,
   XCircle,
 } from "lucide-react";
+import { IntervalTimer } from "@/components/analyses/interval-timer";
 
 interface DecisionMetrics {
   executable_ask_yes?: number | null;
@@ -51,6 +53,14 @@ interface MarketSummary {
   resolution_source?: string | null;
 }
 
+interface TimingProvenance {
+  initial_seconds_remaining?: number;
+  exact_resolves_at?: string;
+  decision_seconds_remaining?: number;
+  pipeline_latency_seconds?: number;
+  interval_phase?: string;
+}
+
 interface ForecastDetail {
   id: string;
   probability_yes: number;
@@ -65,6 +75,7 @@ interface ForecastDetail {
   };
   market: MarketSummary;
   evidence?: EvidenceItem[];
+  timing_provenance?: TimingProvenance;
 }
 
 interface SpecialistContext {
@@ -89,6 +100,7 @@ interface AnalysisDetail {
   status: string;
   created_at: string;
   completed_at?: string | null;
+  events?: Array<{ id: number }>;
   extraction?: {
     platform?: string;
     market_title?: string;
@@ -122,6 +134,8 @@ interface FeedbackResult {
   prediction_made: string;
   postmortem_analysis: string;
   key_learnings: string[];
+  visual_observations?: string | null;
+  discrepancy_classification?: string | null;
 }
 
 const STAGE_INFO: Record<string, { label: string; desc: string; step: number }> = {
@@ -132,12 +146,12 @@ const STAGE_INFO: Record<string, { label: string; desc: string; step: number }> 
   },
   SCREENSHOT_EXTRACTION: {
     label: "Vision Extraction",
-    desc: "Google Gemini reading contract terms, prices, and visible market state...",
+    desc: "Reading contract terms, prices, and visible market state...",
     step: 2,
   },
   MARKET_IDENTIFICATION: {
     label: "Market Discovery",
-    desc: "Searching live platform contracts on Polymarket & Bayse APIs...",
+    desc: "Finding the matching live market contract...",
     step: 3,
   },
   MARKET_VERIFICATION: {
@@ -147,12 +161,14 @@ const STAGE_INFO: Record<string, { label: string; desc: string; step: number }> 
   },
   DATA_COLLECTION: {
     label: "Order Book Ingestion",
-    desc: "Recording real-time CLOB bids, asks, depth, and spread...",
+    desc: "Checking live prices, liquidity, and spread...",
     step: 5,
   },
+  // The backend pipeline performs research and feature building as one stage
+  // (there is no separate RESEARCH emit), so progress mirrors the emitter.
   FEATURE_BUILDING: {
-    label: "Live Context & Feature Building",
-    desc: "Collecting live BTC context and building interval, liquidity, and momentum features...",
+    label: "Evidence Research & Feature Building",
+    desc: "Ranking documentary evidence and building interval, liquidity, and momentum features...",
     step: 6,
   },
   FORECASTING: {
@@ -167,7 +183,10 @@ const STAGE_INFO: Record<string, { label: string; desc: string; step: number }> 
   },
 };
 
-const TOTAL_PIPELINE_STAGES = Object.keys(STAGE_INFO).length;
+// Keys are declared in true pipeline execution order (mirrors backend PIPELINE_STAGES).
+const STAGE_ORDER = Object.keys(STAGE_INFO);
+
+const TOTAL_PIPELINE_STAGES = STAGE_ORDER.length;
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -188,9 +207,23 @@ export default function PredictionMarketHome() {
   const [submittingFeedback, setSubmittingFeedback] = useState(false);
   const [feedbackResult, setFeedbackResult] = useState<FeedbackResult | null>(null);
   const [feedbackError, setFeedbackError] = useState<string | null>(null);
+  const [settlementFile, setSettlementFile] = useState<File | null>(null);
+  const [settlementPreview, setSettlementPreview] = useState<string | null>(null);
+  const settlementInputRef = useRef<HTMLInputElement>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
+  // Highest pipeline step confirmed by server events so the bar never regresses
+  // (guards against late SSE replays or unknown stage names).
+  const progressStepRef = useRef(0);
+
+  const advanceStage = (stage: string) => {
+    const step = STAGE_INFO[stage]?.step ?? 0;
+    if (step > 0 && step >= progressStepRef.current) {
+      progressStepRef.current = step;
+      setCurrentStage(stage);
+    }
+  };
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
@@ -218,8 +251,12 @@ export default function PredictionMarketHome() {
     setFile(null);
     setPreviewUrl(null);
     setHint("");
+    setSettlementFile(null);
+    if (settlementPreview) URL.revokeObjectURL(settlementPreview);
+    setSettlementPreview(null);
     setLoading(false);
     setAnalysisId(null);
+    progressStepRef.current = 0;
     setCurrentStage(null);
     setLatestProgressMessage("");
     setAnalysisDetail(null);
@@ -238,6 +275,7 @@ export default function PredictionMarketHome() {
     setLoading(true);
     setErrorMsg(null);
     setAnalysisDetail(null);
+    progressStepRef.current = 1;
     setCurrentStage("IMAGE_VALIDATION");
     setLatestProgressMessage("Initializing analysis and validating screenshot format...");
 
@@ -285,7 +323,9 @@ export default function PredictionMarketHome() {
     sse.addEventListener("analysis.stage", (e: MessageEvent) => {
       try {
         const payload = JSON.parse(e.data);
-        setCurrentStage(payload.stage);
+        if (typeof payload.stage === "string") {
+          advanceStage(payload.stage);
+        }
         if (payload.message) {
           setLatestProgressMessage(payload.message);
         }
@@ -295,6 +335,7 @@ export default function PredictionMarketHome() {
     });
 
     sse.addEventListener("analysis.completed", async () => {
+      advanceStage("DECISION_EVALUATION");
       sse.close();
       setLoading(false);
       await fetchFinalResult(id);
@@ -364,19 +405,46 @@ export default function PredictionMarketHome() {
     }
   };
 
+  const handleSettlementFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files[0]) {
+      const selected = e.target.files[0];
+      setSettlementFile(selected);
+      setSettlementPreview(URL.createObjectURL(selected));
+    }
+  };
+
+  const removeSettlementFile = () => {
+    setSettlementFile(null);
+    if (settlementPreview) URL.revokeObjectURL(settlementPreview);
+    setSettlementPreview(null);
+    if (settlementInputRef.current) settlementInputRef.current.value = "";
+  };
+
   const submitFeedback = async () => {
     if (!analysisId) return;
     setSubmittingFeedback(true);
     setFeedbackError(null);
     try {
-      const res = await fetch(`${API_BASE}/api/v1/analyses/${analysisId}/feedback`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          actual_outcome: feedbackOutcome,
-          notes: feedbackNotes.trim() || null,
-        }),
-      });
+      let res: Response;
+      if (settlementFile) {
+        const formData = new FormData();
+        formData.append("actual_outcome", feedbackOutcome);
+        if (feedbackNotes.trim()) formData.append("notes", feedbackNotes.trim());
+        formData.append("file", settlementFile);
+        res = await fetch(`${API_BASE}/api/v1/analyses/${analysisId}/feedback`, {
+          method: "POST",
+          body: formData,
+        });
+      } else {
+        res = await fetch(`${API_BASE}/api/v1/analyses/${analysisId}/feedback`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            actual_outcome: feedbackOutcome,
+            notes: feedbackNotes.trim() || null,
+          }),
+        });
+      }
       if (!res.ok) {
         const errJson = await res.json().catch(() => ({}));
         throw new Error(errJson.detail || "Failed to submit post-settlement feedback");
@@ -401,6 +469,9 @@ export default function PredictionMarketHome() {
   const forecast = analysisDetail?.forecast;
   const metrics = forecast?.decision_metrics;
   const stageMeta = currentStage ? STAGE_INFO[currentStage] : null;
+  const progressPercent = stageMeta
+    ? Math.round((stageMeta.step / TOTAL_PIPELINE_STAGES) * 100)
+    : 0;
 
   // Determine which UX state to render:
   // State 1: "upload" (idle, no analysis running, no results)
@@ -411,25 +482,16 @@ export default function PredictionMarketHome() {
   const hasErrorOnly = !loading && Boolean(errorMsg) && !hasResult;
 
   return (
-    <div className="min-h-screen bg-zinc-950 text-zinc-100 font-sans selection:bg-sky-500 selection:text-white">
+    <div className="min-h-screen bg-canvas text-zinc-900 font-sans selection:bg-accent/15 selection:text-zinc-900">
       {/* Top Header */}
-      <header className="border-b border-zinc-800/80 bg-zinc-900/40 backdrop-blur-md sticky top-0 z-50">
+      <header className="sticky top-0 z-50 border-b border-line/80 bg-canvas/80 backdrop-blur-md">
         <div className="max-w-6xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <div className="size-9 rounded-lg bg-gradient-to-tr from-sky-500 to-indigo-600 flex items-center justify-center shadow-lg shadow-sky-500/20">
-              <Scale className="size-5 text-white" />
-            </div>
-            <div>
-              <span className="font-semibold tracking-tight text-white flex items-center gap-2">
-                Prediction Intelligence
-                <span className="text-[10px] font-mono uppercase px-2 py-0.5 rounded-full bg-sky-500/10 text-sky-400 border border-sky-500/20">
-                  AI Cockpit
-                </span>
+            <Link href="/" className="group flex items-baseline gap-2.5" aria-label="Klocka Prediction home">
+              <span className="font-brand text-[27px] leading-none tracking-[-0.01em] text-zinc-950">
+                Klocka<span className="text-accent">.</span>
               </span>
-              <p className="text-xs text-zinc-400">
-                Verified-Market Screenshot Analysis & Calibrated Probability Forecasts
-              </p>
-            </div>
+            </Link>
           </div>
 
           <div className="flex items-center gap-3 text-xs font-mono">
@@ -437,15 +499,15 @@ export default function PredictionMarketHome() {
               <button
                 type="button"
                 onClick={resetAnalysis}
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-zinc-700 bg-zinc-800/80 hover:bg-zinc-700 text-zinc-200 transition-colors"
+                className="flex items-center gap-1.5 rounded-lg border border-line bg-surface px-3 py-1.5 text-zinc-600 transition-colors hover:border-zinc-300 hover:text-zinc-900"
               >
                 <ArrowLeft className="size-3.5" />
                 Upload New Image
               </button>
             )}
-            <span className="hidden sm:flex items-center gap-1.5 text-zinc-400">
+            <span className="hidden items-center gap-1.5 text-zinc-500 sm:flex">
               <span className="size-2 rounded-full bg-emerald-400 animate-pulse" />
-              Polymarket & Bayse CLOB
+              Live market data connected
             </span>
           </div>
         </div>
@@ -459,18 +521,18 @@ export default function PredictionMarketHome() {
         {!isProcessing && !hasResult && (
           <div className="max-w-xl mx-auto space-y-6">
             <div className="text-center space-y-2">
-              <span className="text-[11px] font-mono uppercase tracking-widest text-sky-400 font-semibold px-2.5 py-1 rounded-full bg-sky-500/10 border border-sky-500/20">
-                Screenshot-Driven Probabilistic Intelligence
+              <span className="inline-flex rounded-full border border-accent/20 bg-accent/10 px-2.5 py-1 font-mono text-[11px] font-semibold uppercase tracking-widest text-accent">
+                Trade smarter
               </span>
-              <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-white pt-2">
+              <h1 className="pt-2 text-2xl font-bold tracking-tight text-zinc-950 sm:text-3xl">
                 Upload Market Screenshot
               </h1>
-              <p className="text-sm text-zinc-400 max-w-md mx-auto">
-                Drop any screenshot from Polymarket or Bayse. The AI extracts the contract, verifies order book depth, studies interval patterns, and computes an Expected Value decision.
+              <p className="mx-auto max-w-md text-sm text-zinc-500">
+                Upload a market screenshot. We identify the contract, compare it with live data, and return a probability with the key risks.
               </p>
             </div>
 
-            <div className="rounded-2xl border border-zinc-800 bg-zinc-900/60 p-6 sm:p-8 shadow-2xl backdrop-blur-sm space-y-6">
+            <div className="space-y-6 rounded-2xl border border-line bg-surface p-6 shadow-[0_18px_48px_-24px_rgba(23,23,23,0.16)] sm:p-8">
               {/* Dropzone */}
               <div
                 onDragOver={(e) => e.preventDefault()}
@@ -478,8 +540,8 @@ export default function PredictionMarketHome() {
                 onClick={() => fileInputRef.current?.click()}
                 className={`group relative cursor-pointer rounded-xl border-2 border-dashed transition-all p-8 flex flex-col items-center justify-center text-center overflow-hidden ${
                   previewUrl
-                    ? "border-sky-500/40 bg-zinc-950/80"
-                    : "border-zinc-800 hover:border-sky-500/50 bg-zinc-950/40 hover:bg-sky-500/[0.02]"
+                    ? "border-accent/40 bg-raised/70"
+                    : "border-line bg-raised/40 hover:border-accent/40 hover:bg-accent/[0.03]"
                 }`}
               >
                 <input
@@ -492,7 +554,7 @@ export default function PredictionMarketHome() {
 
                 {previewUrl ? (
                   <div className="space-y-4 w-full">
-                    <div className="relative rounded-lg overflow-hidden border border-zinc-700/80 max-h-64 w-full flex items-center justify-center bg-black">
+                    <div className="relative flex max-h-64 w-full items-center justify-center overflow-hidden rounded-lg border border-line bg-raised">
                       <Image
                         src={previewUrl}
                         alt="Screenshot preview"
@@ -501,24 +563,24 @@ export default function PredictionMarketHome() {
                         className="object-contain max-h-64 w-auto"
                       />
                     </div>
-                    <div className="flex items-center justify-between text-xs text-zinc-400 px-1">
-                      <span className="truncate max-w-[220px] font-mono text-zinc-300">
+                    <div className="flex items-center justify-between px-1 text-xs text-zinc-500">
+                      <span className="max-w-[220px] truncate font-mono text-zinc-700">
                         {file?.name || "Uploaded Image"}
                       </span>
-                      <span className="text-sky-400 font-medium group-hover:underline">
+                      <span className="font-medium text-accent group-hover:underline">
                         Change image
                       </span>
                     </div>
                   </div>
                 ) : (
                   <>
-                    <div className="size-14 rounded-full bg-zinc-800/80 group-hover:bg-sky-500/20 group-hover:text-sky-400 flex items-center justify-center text-zinc-400 transition-colors mb-3">
+                    <div className="mb-3 flex size-14 items-center justify-center rounded-full bg-raised text-zinc-500 transition-colors group-hover:bg-accent/10 group-hover:text-accent">
                       <Upload className="size-6" />
                     </div>
-                    <p className="text-sm font-semibold text-zinc-200">
-                      Drag & drop screenshot here, or <span className="text-sky-400">browse</span>
+                    <p className="text-sm font-semibold text-zinc-800">
+                      Drag & drop screenshot here, or <span className="text-accent">browse</span>
                     </p>
-                    <p className="text-xs text-zinc-500 mt-1.5">
+                    <p className="mt-1.5 text-xs text-zinc-500">
                       Supports PNG, JPEG, WebP up to 10MB
                     </p>
                   </>
@@ -527,7 +589,7 @@ export default function PredictionMarketHome() {
 
               {/* Optional Reference Link */}
               <div className="space-y-1.5">
-                <label className="text-xs font-medium text-zinc-300">
+                <label className="text-xs font-medium text-zinc-700">
                   Optional Market Reference / Slug
                 </label>
                 <input
@@ -535,16 +597,16 @@ export default function PredictionMarketHome() {
                   placeholder="e.g. will-btc-reach-100k-in-2026"
                   value={hint}
                   onChange={(e) => setHint(e.target.value)}
-                  className="w-full h-10 px-3.5 rounded-lg border border-zinc-800 bg-zinc-950/80 text-xs text-zinc-200 placeholder:text-zinc-600 focus:outline-none focus:border-sky-500/60 focus:ring-1 focus:ring-sky-500/60 transition-colors"
+                  className="h-10 w-full rounded-lg border border-line bg-surface px-3.5 text-xs text-zinc-800 transition-colors placeholder:text-zinc-400 focus:border-accent/50 focus:outline-none focus:ring-2 focus:ring-accent/15"
                 />
                 <p className="text-[11px] text-zinc-500">
-                  Used for disambiguation if image quality is degraded. Contract identity is always verified via official platform APIs.
+                  Used for disambiguation if image quality is degraded. Contract identity is always verified before analysis.
                 </p>
               </div>
 
               {/* Error banner if present */}
               {errorMsg && (
-                <div className="rounded-lg border border-rose-500/30 bg-rose-500/10 p-3.5 flex items-start gap-2.5 text-xs text-rose-300">
+                <div className="flex items-start gap-2.5 rounded-lg border border-rose-200 bg-rose-50 p-3.5 text-xs text-rose-700">
                   <AlertTriangle className="size-4 shrink-0 mt-0.5" />
                   <span>{errorMsg}</span>
                 </div>
@@ -555,7 +617,7 @@ export default function PredictionMarketHome() {
                 type="button"
                 onClick={startAnalysis}
                 disabled={!file && !hint}
-                className="w-full h-12 rounded-xl bg-sky-500 hover:bg-sky-400 disabled:bg-zinc-800 disabled:text-zinc-600 disabled:cursor-not-allowed text-zinc-950 font-bold text-sm transition-all shadow-lg shadow-sky-500/20 flex items-center justify-center gap-2 cursor-pointer"
+                className="flex h-12 w-full cursor-pointer items-center justify-center gap-2 rounded-xl bg-accent-strong text-sm font-bold text-white shadow-[0_10px_24px_-10px_rgba(217,45,36,0.6)] transition-all hover:bg-accent-strong-hover disabled:cursor-not-allowed disabled:bg-zinc-200 disabled:text-zinc-400 disabled:shadow-none"
               >
                 <Scale className="size-4" />
                 Analyze Prediction Market
@@ -564,7 +626,7 @@ export default function PredictionMarketHome() {
 
             {/* Subtle Product Boundary Note */}
             <div className="flex items-center justify-center gap-2 text-[11px] text-zinc-500">
-              <ShieldCheck className="size-3.5 text-sky-400/80 shrink-0" />
+              <ShieldCheck className="size-3.5 shrink-0 text-accent/80" />
               <span>Analysis & decision support only · Never executes trades or holds funds</span>
             </div>
           </div>
@@ -575,38 +637,38 @@ export default function PredictionMarketHome() {
         {/* ========================================================= */}
         {isProcessing && (
           <div className="max-w-md mx-auto my-12 text-center space-y-8">
-            <div className="rounded-3xl border border-zinc-800 bg-zinc-900/60 p-10 shadow-2xl backdrop-blur-sm space-y-6">
+            <div className="space-y-6 rounded-3xl border border-line bg-surface p-10 shadow-[0_18px_48px_-24px_rgba(23,23,23,0.16)]">
               {/* Spinner */}
               <div className="relative size-24 mx-auto flex items-center justify-center">
-                <div className="absolute inset-0 rounded-full border-4 border-sky-500/20 border-t-sky-500 animate-spin" />
-                <div className="absolute inset-2 rounded-full border-4 border-indigo-500/10 border-b-indigo-400 animate-spin [animation-duration:1.8s]" />
-                <Scale className="size-8 text-sky-400 animate-pulse" />
+                <div className="absolute inset-0 animate-spin rounded-full border-4 border-accent/15 border-t-accent" />
+                <div className="absolute inset-2 animate-spin rounded-full border-4 border-zinc-200 border-b-zinc-400 [animation-duration:1.8s]" />
+                <Scale className="size-8 animate-pulse text-accent" />
               </div>
 
               {/* Progress Text Below Spinner */}
               <div className="space-y-2">
-                <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-sky-500/10 border border-sky-500/20 text-xs font-mono text-sky-400">
-                  <span className="size-1.5 rounded-full bg-sky-400 animate-ping" />
+                <div className="inline-flex items-center gap-2 rounded-full border border-accent/20 bg-accent/10 px-3 py-1 font-mono text-xs text-accent">
+                  <span className="size-1.5 animate-ping rounded-full bg-accent" />
                   {stageMeta
                     ? `Step ${stageMeta.step} of ${TOTAL_PIPELINE_STAGES}: ${stageMeta.label}`
                     : "Executing Pipeline"}
                 </div>
 
-                <h3 className="text-lg font-semibold text-white">
+                <h3 className="text-lg font-semibold text-zinc-900">
                   {stageMeta?.label || "Processing Market Contract..."}
                 </h3>
 
-                <p className="text-xs text-zinc-400 min-h-[36px] flex items-center justify-center px-4 leading-relaxed">
+                <p className="flex min-h-[36px] items-center justify-center px-4 text-xs leading-relaxed text-zinc-500">
                   {latestProgressMessage || stageMeta?.desc || "Cross-referencing multimodal signals and order books..."}
                 </p>
               </div>
 
               {/* Step indicator bar */}
-              <div className="w-full bg-zinc-800/80 h-1.5 rounded-full overflow-hidden">
+              <div className="h-1.5 w-full overflow-hidden rounded-full bg-raised">
                 <div
-                  className="bg-gradient-to-r from-sky-500 to-indigo-500 h-full transition-all duration-500 rounded-full"
+                  className="h-full rounded-full bg-gradient-to-r from-accent-strong to-accent transition-all duration-500"
                   style={{
-                    width: `${Math.max(12, ((stageMeta?.step || 1) / TOTAL_PIPELINE_STAGES) * 100)}%`,
+                    width: `${progressPercent}%`,
                   }}
                 />
               </div>
@@ -615,7 +677,7 @@ export default function PredictionMarketHome() {
               <button
                 type="button"
                 onClick={resetAnalysis}
-                className="text-xs text-zinc-500 hover:text-zinc-300 font-medium transition-colors pt-2"
+                className="pt-2 text-xs font-medium text-zinc-500 transition-colors hover:text-zinc-900"
               >
                 Cancel and start over
               </button>
@@ -624,22 +686,22 @@ export default function PredictionMarketHome() {
         )}
 
         {/* ========================================================= */}
-        {/* STATE 2b: ERROR ONLY (e.g. Gemini key missing or network) */}
+        {/* STATE 2b: ERROR ONLY */}
         {/* ========================================================= */}
         {hasErrorOnly && (
           <div className="max-w-lg mx-auto my-12">
-            <div className="rounded-2xl border border-rose-500/30 bg-rose-500/[0.04] p-8 shadow-2xl text-center space-y-4">
-              <div className="size-12 rounded-full bg-rose-500/10 text-rose-400 flex items-center justify-center mx-auto">
+            <div className="space-y-4 rounded-2xl border border-rose-200 bg-rose-50/60 p-8 text-center shadow-[0_18px_48px_-24px_rgba(23,23,23,0.16)]">
+              <div className="mx-auto flex size-12 items-center justify-center rounded-full bg-rose-100 text-rose-600">
                 <XCircle className="size-6" />
               </div>
-              <h3 className="text-lg font-semibold text-white">Analysis Could Not Complete</h3>
-              <p className="text-xs text-rose-300 bg-rose-500/10 p-3 rounded-lg border border-rose-500/20 font-mono">
+              <h3 className="text-lg font-semibold text-zinc-900">Analysis Could Not Complete</h3>
+              <p className="rounded-lg border border-rose-200 bg-rose-100/60 p-3 font-mono text-xs text-rose-700">
                 {errorMsg}
               </p>
               <button
                 type="button"
                 onClick={resetAnalysis}
-                className="px-5 py-2.5 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-white font-medium text-xs transition-colors cursor-pointer"
+                className="cursor-pointer rounded-xl border border-line bg-surface px-5 py-2.5 text-xs font-medium text-zinc-800 transition-colors hover:bg-raised"
               >
                 ← Return to Upload
               </button>
@@ -654,30 +716,30 @@ export default function PredictionMarketHome() {
           <div className="space-y-6 animate-fade-in">
             {/* User Confirmation Required State */}
             {analysisDetail?.status === "NEEDS_USER_CONFIRMATION" && (
-              <div className="rounded-2xl border border-amber-500/40 bg-amber-500/[0.04] p-6 shadow-xl space-y-4">
-                <div className="flex items-center gap-2 text-amber-400 font-semibold text-sm">
+              <div className="space-y-4 rounded-2xl border border-amber-200 bg-amber-50/70 p-6 shadow-[0_18px_48px_-24px_rgba(23,23,23,0.16)]">
+                <div className="flex items-center gap-2 text-sm font-semibold text-amber-700">
                   <AlertTriangle className="size-5" />
                   Contract Discrepancy — User Confirmation Required
                 </div>
-                <p className="text-xs text-zinc-300">
-                  Multiple candidate markets were found on the platform API. Please confirm which contract you are evaluating:
+                <p className="text-xs text-zinc-600">
+                  Multiple matching contracts were found. Please confirm which one you are evaluating:
                 </p>
                 <div className="space-y-2">
                   {analysisDetail.verification?.candidates?.map((c) => (
                     <div
                       key={c.candidate_id}
-                      className="p-3.5 rounded-lg border border-zinc-800 bg-zinc-900 flex items-center justify-between gap-3 text-xs"
+                      className="flex items-center justify-between gap-3 rounded-lg border border-line bg-surface p-3.5 text-xs"
                     >
                       <div>
-                        <div className="font-medium text-white">{c.title}</div>
+                        <div className="font-medium text-zinc-900">{c.title}</div>
                         <div className="text-[11px] text-zinc-500">
-                          Venue: <span className="uppercase text-sky-400">{c.platform}</span> · Match Confidence:{" "}
+                          Venue: <span className="uppercase text-accent">{c.platform}</span> · Match Confidence:{" "}
                           {(c.similarity_score * 100).toFixed(0)}%
                         </div>
                       </div>
                       <button
                         onClick={() => confirmCandidate(c.candidate_id)}
-                        className="px-3.5 py-1.5 rounded-lg bg-sky-500 hover:bg-sky-400 text-zinc-950 font-semibold text-xs transition-colors shrink-0"
+                        className="shrink-0 rounded-lg bg-accent-strong px-3.5 py-1.5 text-xs font-semibold text-white transition-colors hover:bg-accent-strong-hover"
                       >
                         Confirm This Market
                       </button>
@@ -689,45 +751,55 @@ export default function PredictionMarketHome() {
 
             {/* Completed Forecast Cockpit */}
             {forecast && (
-              <div className="rounded-2xl border border-zinc-800 bg-zinc-900/60 p-6 sm:p-8 shadow-2xl space-y-6">
+              <div className="space-y-6 rounded-2xl border border-line bg-surface p-6 shadow-[0_18px_48px_-24px_rgba(23,23,23,0.16)] sm:p-8">
+                {/* Live Interval Countdown & Timing Provenance */}
+                {(forecast.market?.resolves_at || forecast.timing_provenance) && (
+                  <IntervalTimer
+                    resolvesAt={forecast.market?.resolves_at || forecast.timing_provenance?.exact_resolves_at}
+                    pipelineLatencySeconds={forecast.timing_provenance?.pipeline_latency_seconds}
+                    initialSecondsRemaining={forecast.timing_provenance?.initial_seconds_remaining}
+                    decisionSecondsRemaining={forecast.timing_provenance?.decision_seconds_remaining}
+                  />
+                )}
+
                 {/* Result Top Line */}
-                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-6 border-b border-zinc-800">
+                <div className="flex flex-col justify-between gap-4 border-b border-line pb-6 sm:flex-row sm:items-center">
                   <div>
                     <span className="text-xs font-mono uppercase tracking-wider text-zinc-500">
                       Recommendation Decision
                     </span>
                     <div className="mt-1 flex items-center gap-3">
                       {forecast.recommendation === "BUY_YES" && (
-                        <span className="px-3.5 py-1 rounded-full bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 font-bold text-sm tracking-wide flex items-center gap-1.5">
+                        <span className="flex items-center gap-1.5 rounded-full border border-emerald-200 bg-emerald-50 px-3.5 py-1 text-sm font-bold tracking-wide text-emerald-700">
                           <TrendingUp className="size-4" />
                           BUY YES
                         </span>
                       )}
                       {forecast.recommendation === "BUY_NO" && (
-                        <span className="px-3.5 py-1 rounded-full bg-indigo-500/15 text-indigo-400 border border-indigo-500/30 font-bold text-sm tracking-wide flex items-center gap-1.5">
+                        <span className="flex items-center gap-1.5 rounded-full border border-rose-200 bg-rose-50 px-3.5 py-1 text-sm font-bold tracking-wide text-rose-700">
                           <TrendingDown className="size-4" />
                           BUY NO
                         </span>
                       )}
                       {forecast.recommendation === "NO_TRADE" && (
-                        <span className="px-3.5 py-1 rounded-full bg-zinc-800 text-zinc-300 border border-zinc-700 font-semibold text-sm tracking-wide">
+                        <span className="rounded-full border border-line bg-raised px-3.5 py-1 text-sm font-semibold tracking-wide text-zinc-600">
                           NO TRADE (Abstain)
                         </span>
                       )}
-                      <span className="text-xs text-zinc-400 font-medium">
+                      <span className="text-xs font-medium text-zinc-500">
                         {forecast.explanation?.decision_reason || "Disciplined risk gate applied."}
                       </span>
                     </div>
                   </div>
 
-                  <div className="sm:text-right sm:border-l sm:border-zinc-800 sm:pl-6">
+                  <div className="sm:border-l sm:border-line sm:pl-6 sm:text-right">
                     <span className="text-xs font-mono uppercase tracking-wider text-zinc-500">
                       Calibrated Model Probability
                     </span>
-                    <div className="text-2xl font-mono font-bold text-white mt-0.5">
+                    <div className="mt-0.5 font-mono text-2xl font-bold text-zinc-900">
                       P(YES) = {(Number(forecast.probability_yes) * 100).toFixed(1)}%
                     </div>
-                    <div className="text-[11px] font-mono text-zinc-400">
+                    <div className="font-mono text-[11px] text-zinc-500">
                       90% CI: [
                       {forecast.uncertainty_interval
                         ? `${(Number(forecast.uncertainty_interval[0]) * 100).toFixed(0)}% - ${(Number(forecast.uncertainty_interval[1]) * 100).toFixed(0)}%`
@@ -740,29 +812,29 @@ export default function PredictionMarketHome() {
                 {/* Probability Distribution Bar */}
                 <div className="space-y-1.5">
                   <div className="flex justify-between text-xs font-medium">
-                    <span className="text-emerald-400">
+                    <span className="text-emerald-600">
                       YES: {(Number(forecast.probability_yes) * 100).toFixed(1)}%
                     </span>
-                    <span className="text-indigo-400">
+                    <span className="text-rose-600">
                       NO: {(Number(forecast.probability_no) * 100).toFixed(1)}%
                     </span>
                   </div>
-                  <div className="h-3 w-full rounded-full bg-zinc-800 overflow-hidden flex">
+                  <div className="flex h-3 w-full overflow-hidden rounded-full bg-raised">
                     <div
                       style={{ width: `${Number(forecast.probability_yes) * 100}%` }}
                       className="bg-emerald-500 transition-all duration-700"
                     />
                     <div
                       style={{ width: `${Number(forecast.probability_no) * 100}%` }}
-                      className="bg-indigo-500 transition-all duration-700"
+                      className="bg-rose-500 transition-all duration-700"
                     />
                   </div>
                 </div>
 
                 {/* Verified Market Specification */}
-                <div className="rounded-xl bg-zinc-950/70 border border-zinc-800/80 p-4 space-y-2">
+                <div className="space-y-2 rounded-xl border border-line bg-raised/60 p-4">
                   <div className="flex items-center justify-between text-xs">
-                    <span className="font-mono text-sky-400 uppercase tracking-wider font-semibold">
+                    <span className="font-mono font-semibold uppercase tracking-wider text-accent">
                       Venue: {forecast.market?.platform}
                     </span>
                     {forecast.market?.url && (
@@ -770,13 +842,13 @@ export default function PredictionMarketHome() {
                         href={forecast.market.url}
                         target="_blank"
                         rel="noreferrer"
-                        className="text-zinc-500 hover:text-zinc-300 flex items-center gap-1 text-[11px]"
+                        className="flex items-center gap-1 text-[11px] text-zinc-500 hover:text-zinc-900"
                       >
                         View Official Contract <ExternalLink className="size-3" />
                       </a>
                     )}
                   </div>
-                  <h4 className="text-sm font-semibold text-zinc-100">
+                  <h4 className="text-sm font-semibold text-zinc-900">
                     {forecast.market?.title}
                   </h4>
                   {forecast.market?.resolves_at && (
@@ -789,16 +861,16 @@ export default function PredictionMarketHome() {
 
                 {/* Specialist Domain Study (15-Minute Interval Patterns & Momentum) */}
                 {forecast.specialist_context && (
-                  <div className="rounded-xl bg-zinc-950/70 border border-zinc-800/80 p-4 space-y-3">
+                  <div className="space-y-3 rounded-xl border border-line bg-raised/60 p-4">
                     <div className="flex items-center justify-between text-xs">
-                      <div className="flex items-center gap-2 font-mono text-amber-400 uppercase tracking-wider font-semibold">
+                      <div className="flex items-center gap-2 font-mono font-semibold uppercase tracking-wider text-amber-700">
                         <span>Domain Interval Study & Microstructure</span>
-                        <span className="text-[10px] px-2 py-0.5 rounded bg-amber-500/10 text-amber-400 border border-amber-500/20 font-normal">
+                        <span className="rounded border border-amber-200 bg-amber-50 px-2 py-0.5 text-[10px] font-normal text-amber-700">
                           {forecast.specialist_context.category?.toUpperCase() || "CRYPTO"} SPECIALIST
                         </span>
                       </div>
                       {forecast.specialist_context.crypto_research?.live_spot_reference?.price && (
-                        <span className="text-xs font-mono text-zinc-300">
+                        <span className="font-mono text-xs text-zinc-700">
                           Spot: ${Number(forecast.specialist_context.crypto_research.live_spot_reference.price).toLocaleString()}
                         </span>
                       )}
@@ -806,21 +878,21 @@ export default function PredictionMarketHome() {
 
                     {forecast.specialist_context.crypto_research?.interval_study && (
                       <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 text-xs">
-                        <div className="p-2.5 rounded bg-zinc-900/80 border border-zinc-800">
+                        <div className="rounded border border-line bg-surface p-2.5">
                           <div className="text-[10px] font-mono text-zinc-500 uppercase">15m Trend Pattern</div>
-                          <div className="font-semibold text-zinc-200 mt-0.5 capitalize">
+                          <div className="mt-0.5 font-semibold capitalize text-zinc-800">
                             {forecast.specialist_context.crypto_research.interval_study.recent_interval_trend?.replace(/_/g, " ")}
                           </div>
                         </div>
-                        <div className="p-2.5 rounded bg-zinc-900/80 border border-zinc-800">
+                        <div className="rounded border border-line bg-surface p-2.5">
                           <div className="text-[10px] font-mono text-zinc-500 uppercase">15m RSI Oscillator</div>
-                          <div className="font-semibold text-emerald-400 mt-0.5">
+                          <div className="mt-0.5 font-semibold text-emerald-600">
                             {forecast.specialist_context.crypto_research.interval_study.momentum_oscillator_rsi_15m}
                           </div>
                         </div>
-                        <div className="p-2.5 rounded bg-zinc-900/80 border border-zinc-800 col-span-2 sm:col-span-1">
+                        <div className="col-span-2 rounded border border-line bg-surface p-2.5 sm:col-span-1">
                           <div className="text-[10px] font-mono text-zinc-500 uppercase">Order Flow Imbalance</div>
-                          <div className="font-semibold text-zinc-200 mt-0.5 truncate">
+                          <div className="mt-0.5 truncate font-semibold text-zinc-800">
                             {forecast.specialist_context.crypto_research.interval_study.order_book_depth_ratio_bids_vs_asks}
                           </div>
                         </div>
@@ -828,7 +900,7 @@ export default function PredictionMarketHome() {
                     )}
 
                     {forecast.specialist_context.crypto_research?.sentiment_and_social_signals && (
-                      <div className="text-xs text-zinc-400 bg-zinc-900/50 p-2.5 rounded border border-zinc-800 space-y-1">
+                      <div className="space-y-1 rounded border border-line bg-surface p-2.5 text-xs text-zinc-600">
                         <div className="text-[10px] font-mono uppercase text-zinc-500">Social Media & Sentiment Consensus</div>
                         <div>{forecast.specialist_context.crypto_research.sentiment_and_social_signals.social_media_prediction_consensus}</div>
                       </div>
@@ -838,46 +910,46 @@ export default function PredictionMarketHome() {
 
                 {/* EV Decision Metrics Grid */}
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
-                  <div className="p-3 rounded-lg border border-zinc-800/80 bg-zinc-950">
+                  <div className="rounded-lg border border-line bg-raised/40 p-3">
                     <div className="text-zinc-500 font-mono text-[10px] uppercase">Ask YES</div>
-                    <div className="text-sm font-mono font-semibold text-zinc-200 mt-1">
+                    <div className="mt-1 font-mono text-sm font-semibold text-zinc-800">
                       ${Number(metrics?.executable_ask_yes ?? 0).toFixed(3)}
                     </div>
                   </div>
-                  <div className="p-3 rounded-lg border border-zinc-800/80 bg-zinc-950">
+                  <div className="rounded-lg border border-line bg-raised/40 p-3">
                     <div className="text-zinc-500 font-mono text-[10px] uppercase">Effective Cost</div>
-                    <div className="text-sm font-mono font-semibold text-zinc-200 mt-1">
+                    <div className="mt-1 font-mono text-sm font-semibold text-zinc-800">
                       ${Number(metrics?.effective_cost_yes ?? 0).toFixed(3)}
                     </div>
                   </div>
-                  <div className="p-3 rounded-lg border border-zinc-800/80 bg-zinc-950">
+                  <div className="rounded-lg border border-line bg-raised/40 p-3">
                     <div className="text-zinc-500 font-mono text-[10px] uppercase">Net Edge (YES)</div>
                     <div
                       className={`text-sm font-mono font-semibold mt-1 ${
                         Number(metrics?.estimated_net_edge_yes ?? 0) > 0
-                          ? "text-emerald-400"
-                          : "text-zinc-400"
+                          ? "text-emerald-600"
+                          : "text-zinc-500"
                       }`}
                     >
                       {Number(metrics?.estimated_net_edge_yes ?? 0) > 0 ? "+" : ""}
                       {(Number(metrics?.estimated_net_edge_yes ?? 0) * 100).toFixed(2)}%
                     </div>
                   </div>
-                  <div className="p-3 rounded-lg border border-zinc-800/80 bg-zinc-950">
+                  <div className="rounded-lg border border-line bg-raised/40 p-3">
                     <div className="text-zinc-500 font-mono text-[10px] uppercase">Quarter-Kelly</div>
-                    <div className="text-sm font-mono font-semibold text-zinc-200 mt-1">
+                    <div className="mt-1 font-mono text-sm font-semibold text-zinc-800">
                       {(Number(metrics?.quarter_kelly_fraction ?? 0) * 100).toFixed(1)}%
                     </div>
                   </div>
                 </div>
 
-                {/* Gemini Analytical Synthesis & Reasoning */}
+                {/* Analysis reasoning */}
                 {forecast.explanation?.reasoning && (
                   <div className="space-y-2">
-                    <h5 className="text-xs font-semibold text-zinc-300 uppercase tracking-wider font-mono">
-                      Gemini Multimodal Reasoning Synthesis
+                    <h5 className="font-mono text-xs font-semibold uppercase tracking-wider text-zinc-600">
+                      Analysis reasoning
                     </h5>
-                    <p className="text-xs text-zinc-400 leading-relaxed bg-zinc-950/60 p-3.5 rounded-lg border border-zinc-800/80">
+                    <p className="rounded-lg border border-line bg-raised/50 p-3.5 text-xs leading-relaxed text-zinc-600">
                       {forecast.explanation.reasoning}
                     </p>
                   </div>
@@ -886,22 +958,22 @@ export default function PredictionMarketHome() {
                 {/* Itemized Evidence Citations */}
                 {forecast.evidence && forecast.evidence.length > 0 && (
                   <div className="space-y-2">
-                    <h5 className="text-xs font-semibold text-zinc-300 uppercase tracking-wider font-mono">
+                    <h5 className="font-mono text-xs font-semibold uppercase tracking-wider text-zinc-600">
                       Documentary Evidence Citations
                     </h5>
                     <div className="space-y-2">
                       {forecast.evidence.map((ev, i) => (
                         <div
                           key={i}
-                          className="p-3 rounded-lg border border-zinc-800/60 bg-zinc-950/40 text-xs space-y-1"
+                          className="space-y-1 rounded-lg border border-line bg-raised/40 p-3 text-xs"
                         >
                           <div className="flex items-center justify-between text-[11px]">
-                            <span className="font-semibold text-zinc-300">{ev.source_citation}</span>
+                            <span className="font-semibold text-zinc-700">{ev.source_citation}</span>
                             <span className="font-mono text-zinc-500 text-[10px]">
                               Relevance: {(Number(ev.relevance_score) * 100).toFixed(0)}%
                             </span>
                           </div>
-                          <p className="text-zinc-400 text-[11px] italic">&ldquo;{ev.snippet}&rdquo;</p>
+                          <p className="text-[11px] italic text-zinc-600">&ldquo;{ev.snippet}&rdquo;</p>
                         </div>
                       ))}
                     </div>
@@ -909,11 +981,11 @@ export default function PredictionMarketHome() {
                 )}
 
                 {/* Continuous Improvement & Post-Settlement Feedback Cockpit */}
-                <div className="rounded-xl bg-zinc-950/80 border border-zinc-800/90 p-5 space-y-4">
+                <div className="space-y-4 rounded-xl border border-line bg-raised/40 p-5">
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-2">
-                      <RefreshCw className="size-4 text-sky-400" />
-                      <h5 className="text-xs font-semibold text-zinc-200 uppercase tracking-wider font-mono">
+                      <RefreshCw className="size-4 text-accent" />
+                      <h5 className="font-mono text-xs font-semibold uppercase tracking-wider text-zinc-800">
                         Trade Completed? Train AI with Actual Settlement
                       </h5>
                     </div>
@@ -922,32 +994,46 @@ export default function PredictionMarketHome() {
                     </span>
                   </div>
 
-                  <p className="text-xs text-zinc-400">
+                  <p className="text-xs text-zinc-500">
                     Once the market candle closes, report whether it resolved YES or NO. The AI records postmortem learnings into SQLite memory to avoid repeating mistakes and continuously improve future accuracy.
                   </p>
 
                   {feedbackResult ? (
-                    <div className="rounded-lg border border-sky-500/30 bg-sky-500/5 p-4 space-y-3">
+                    <div className="space-y-3 rounded-lg border border-accent/20 bg-accent/[0.04] p-4">
                       <div className="flex items-center justify-between">
                         <div className="flex items-center gap-2">
                           {feedbackResult.was_correct ? (
-                            <span className="px-2.5 py-0.5 rounded text-xs font-semibold bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">
+                            <span className="rounded border border-emerald-200 bg-emerald-50 px-2.5 py-0.5 text-xs font-semibold text-emerald-700">
                               Prediction Correct (Aligned)
                             </span>
                           ) : (
-                            <span className="px-2.5 py-0.5 rounded text-xs font-semibold bg-amber-500/20 text-amber-400 border border-amber-500/30">
+                            <span className="rounded border border-amber-200 bg-amber-50 px-2.5 py-0.5 text-xs font-semibold text-amber-700">
                               Discrepancy Analyzed
                             </span>
                           )}
-                          <span className="text-xs text-zinc-300 font-mono">
+                          {feedbackResult.discrepancy_classification && (
+                            <span className="rounded border border-line bg-raised px-2 py-0.5 text-[10px] font-mono font-semibold uppercase tracking-wider text-zinc-600">
+                              {feedbackResult.discrepancy_classification.replace(/_/g, " ")}
+                            </span>
+                          )}
+                          <span className="font-mono text-xs text-zinc-700">
                             Settled as: {feedbackResult.actual_outcome}
                           </span>
                         </div>
                       </div>
 
+                      {feedbackResult.visual_observations && (
+                        <div className="space-y-1 rounded border border-sky-200 bg-sky-50/70 p-3 text-xs text-sky-950">
+                          <div className="flex items-center gap-1.5 font-mono text-[10px] font-bold uppercase tracking-wider text-sky-800">
+                            <span>📷</span> Settlement Screenshot Visual Inspection
+                          </div>
+                          <p className="leading-relaxed">{feedbackResult.visual_observations}</p>
+                        </div>
+                      )}
+
                       <div className="space-y-1">
                         <div className="text-[10px] font-mono uppercase text-zinc-500">AI Postmortem Reflection</div>
-                        <p className="text-xs text-zinc-300 leading-relaxed bg-zinc-900/80 p-3 rounded border border-zinc-800">
+                        <p className="rounded border border-line bg-surface p-3 text-xs leading-relaxed text-zinc-700">
                           {feedbackResult.postmortem_analysis}
                         </p>
                       </div>
@@ -955,7 +1041,7 @@ export default function PredictionMarketHome() {
                       {feedbackResult.key_learnings && feedbackResult.key_learnings.length > 0 && (
                         <div className="space-y-1.5">
                           <div className="text-[10px] font-mono uppercase text-zinc-500">Learnings Injected into SQLite Long-Term Memory</div>
-                          <ul className="space-y-1 text-xs text-zinc-400 list-disc list-inside">
+                          <ul className="list-inside list-disc space-y-1 text-xs text-zinc-500">
                             {feedbackResult.key_learnings.map((l, i) => (
                               <li key={i}>{l}</li>
                             ))}
@@ -966,15 +1052,15 @@ export default function PredictionMarketHome() {
                   ) : (
                     <div className="space-y-3">
                       <div className="flex items-center gap-4">
-                        <label className="text-xs font-medium text-zinc-300">Actual Settlement:</label>
+                        <label className="text-xs font-medium text-zinc-700">Actual Settlement:</label>
                         <div className="flex gap-2">
                           <button
                             type="button"
                             onClick={() => setFeedbackOutcome("YES")}
                             className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
                               feedbackOutcome === "YES"
-                                ? "bg-emerald-500 text-zinc-950 shadow-md shadow-emerald-500/20"
-                                : "bg-zinc-900 text-zinc-400 hover:text-zinc-200 border border-zinc-800"
+                                ? "bg-emerald-600 text-white shadow-md shadow-emerald-600/20"
+                                : "border border-line bg-surface text-zinc-500 hover:text-zinc-900"
                             }`}
                           >
                             Resolved YES
@@ -984,8 +1070,8 @@ export default function PredictionMarketHome() {
                             onClick={() => setFeedbackOutcome("NO")}
                             className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
                               feedbackOutcome === "NO"
-                                ? "bg-indigo-500 text-white shadow-md shadow-indigo-500/20"
-                                : "bg-zinc-900 text-zinc-400 hover:text-zinc-200 border border-zinc-800"
+                                ? "bg-rose-600 text-white shadow-md shadow-rose-600/20"
+                                : "border border-line bg-surface text-zinc-500 hover:text-zinc-900"
                             }`}
                           >
                             Resolved NO
@@ -999,24 +1085,76 @@ export default function PredictionMarketHome() {
                           placeholder="Optional notes: e.g. target reached in minute 8, unexpected news spike, etc."
                           value={feedbackNotes}
                           onChange={(e) => setFeedbackNotes(e.target.value)}
-                          className="w-full h-9 px-3 rounded-lg border border-zinc-800 bg-zinc-900 text-xs text-zinc-200 placeholder:text-zinc-600 focus:outline-none focus:border-sky-500"
+                          className="h-9 w-full rounded-lg border border-line bg-surface px-3 text-xs text-zinc-800 placeholder:text-zinc-400 focus:border-accent/50 focus:outline-none focus:ring-2 focus:ring-accent/15"
                         />
                       </div>
 
+                      {/* Optional Post-Trade Settlement Screenshot Uploader */}
+                      <div className="flex flex-col gap-2 rounded-lg border border-dashed border-line bg-surface/40 p-3">
+                        <div className="flex items-center justify-between">
+                          <span className="text-[11px] font-mono uppercase tracking-wider text-zinc-500">
+                            Visual Trade Postmortem (Optional)
+                          </span>
+                          {settlementFile && (
+                            <button
+                              type="button"
+                              onClick={removeSettlementFile}
+                              className="text-[11px] font-mono text-rose-500 hover:text-rose-600"
+                            >
+                              Remove
+                            </button>
+                          )}
+                        </div>
+                        <p className="text-[11px] text-zinc-500">
+                          Upload a screenshot of the closed candle chart or contract settlement screen. The AI will inspect the visible wicks, volume, and closing price to diagnose where things went wrong.
+                        </p>
+                        <input
+                          ref={settlementInputRef}
+                          type="file"
+                          accept="image/png,image/jpeg,image/webp"
+                          onChange={handleSettlementFileChange}
+                          className="hidden"
+                        />
+                        {!settlementFile ? (
+                          <button
+                            type="button"
+                            onClick={() => settlementInputRef.current?.click()}
+                            className="inline-flex w-fit items-center gap-1.5 rounded-md border border-line bg-surface px-3 py-1.5 text-xs font-medium text-zinc-600 hover:border-accent hover:text-zinc-900 transition-colors"
+                          >
+                            <Upload className="size-3 text-zinc-400" />
+                            Attach Settlement Screenshot
+                          </button>
+                        ) : (
+                          <div className="flex items-center gap-2.5 rounded border border-line bg-surface p-2 text-xs">
+                            {settlementPreview && (
+                              <img
+                                src={settlementPreview}
+                                alt="Settlement Preview"
+                                className="size-8 rounded object-cover border border-line"
+                              />
+                            )}
+                            <div className="min-w-0 flex-1">
+                              <p className="truncate font-mono text-[11px] font-semibold text-zinc-800">{settlementFile.name}</p>
+                              <p className="text-[10px] text-zinc-500">{(settlementFile.size / 1024).toFixed(1)} KB • Multimodal postmortem ready</p>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+
                       {feedbackError && (
-                        <p className="text-xs text-rose-400">{feedbackError}</p>
+                        <p className="text-xs text-rose-600">{feedbackError}</p>
                       )}
 
                       <button
                         type="button"
                         onClick={submitFeedback}
                         disabled={submittingFeedback}
-                        className="px-4 py-2 rounded-lg bg-sky-500 hover:bg-sky-400 disabled:bg-zinc-800 text-zinc-950 font-semibold text-xs transition-colors flex items-center gap-2 cursor-pointer"
+                        className="flex cursor-pointer items-center gap-2 rounded-lg bg-accent-strong px-4 py-2 text-xs font-semibold text-white transition-colors hover:bg-accent-strong-hover disabled:bg-zinc-200 disabled:text-zinc-400"
                       >
                         {submittingFeedback ? (
                           <>
                             <Loader2 className="size-3 animate-spin" />
-                            Analyzing Settlement & Updating SQLite Memory...
+                            Analyzing Settlement & Retraining AI...
                           </>
                         ) : (
                           <>

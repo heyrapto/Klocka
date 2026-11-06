@@ -28,15 +28,17 @@ Platform-specific guidance:
 def build_user_prompt(hint: str | None) -> str:
     prompt = (
         "Transcribe this prediction market screenshot precisely. "
-        "Extract: (1) the exact market question/title, (2) the prediction platform shown, "
-        "(3) all outcome labels with their BUY prices — for Bayse these are labelled "
-        "'Buy Up' and 'Buy Down' in Naira (₦); convert each Naira price to a decimal "
-        "(e.g. ₦58 → 0.58), (4) the displayed CHANCE/probability percentage, "
-        "(5) the market expiry time and date, (6) the resolution condition text, "
-        "(7) the underlying asset (e.g. BTC/USD), (8) the target/strike and comparison "
-        "operator, (9) the countdown text, current round, previous round labels, visible "
-        "chart direction/time range, trade count, and screenshot timestamp when present, "
-        "and (10) evidence bounding boxes for every critical field you read."
+        "Primary focus is the market identity and trade parameters: "
+        "(1) the exact market question, title, or proposition, "
+        "(2) the prediction platform shown (Polymarket, Bayse, or other), "
+        "(3) the underlying asset (e.g. BTC/USD, ETH, Solana), "
+        "(4) target/strike price and comparison operator (>, <, >=, <=) if applicable, "
+        "(5) market expiry time, date, round number, or countdown text, "
+        "(6) any visible outcome labels (e.g. YES/NO, UP/DOWN) and displayed prices/probabilities if shown, "
+        "(7) visible chart observations (trend direction, time horizon), "
+        "(8) resolution condition or rules text, "
+        "and (9) evidence bounding boxes for key text regions. "
+        "Do not worry if buy/sell buttons are absent or cropped out — prioritize identifying the exact trade proposition."
     )
     if hint:
         prompt += (

@@ -5,6 +5,7 @@ import httpx
 import structlog
 
 from prediction_ai.db.sqlite import get_sqlite_db
+from prediction_ai.specialists.public_sports_sources import PublicSportsSourceClient
 from prediction_ai.schemas.research import SportsEvidencePack
 
 logger = structlog.get_logger(__name__)
@@ -22,6 +23,7 @@ class SpecialistResearchService:
         asset: str | None,
         title: str,
         time_to_close_seconds: float | None = None,
+        target_price: float | None = None,
     ) -> dict[str, Any]:
         """Gather domain-specific research context based on market category."""
         sqlite = get_sqlite_db()
@@ -42,9 +44,11 @@ class SpecialistResearchService:
         }
 
         if category == "crypto":
-            context["crypto_research"] = await self._gather_crypto_research(asset, title, time_to_close_seconds)
+            context["crypto_research"] = await self._gather_crypto_research(
+                asset, title, time_to_close_seconds, target_price=target_price
+            )
         elif category == "sports":
-            context["sports_research"] = self._gather_sports_research(title)
+            context["sports_research"] = await self._gather_sports_research(title)
         else:
             context["macro_research"] = self._gather_macro_research(title)
 
@@ -55,84 +59,51 @@ class SpecialistResearchService:
         asset: str | None,
         title: str,
         time_to_close: float | None,
+        target_price: float | None = None,
     ) -> dict[str, Any]:
-        """Gather technical interval patterns, momentum, and sentiment for crypto contracts."""
-        symbol = (asset or "BTC").upper()
-        if "BTC" in title.upper() or "BITCOIN" in title.upper():
-            symbol = "BTC"
-        elif "ETH" in title.upper() or "ETHEREUM" in title.upper():
-            symbol = "ETH"
-        elif "SOL" in title.upper() or "SOLANA" in title.upper():
-            symbol = "SOL"
+        """Gather real crypto intelligence: OHLCV, order-book, derivatives signals,
+        Fear & Greed, and a mathematically grounded log-normal P(YES)."""
+        from datetime import timedelta
 
-        # Check interval horizon
-        is_short_horizon = time_to_close is not None and time_to_close <= 3600  # <= 1 hour (e.g. 15-min contract)
+        from prediction_ai.specialists.crypto.research import gather_crypto_intelligence
 
-        # Synthesize technical intervals & market movement study
-        research: dict[str, Any] = {
-            "symbol": symbol,
-            "contract_horizon": "15-minute / ultra-short interval" if is_short_horizon else "macro / multi-hour",
-            "interval_study": {
-                "15m_volatility_bps": 45,
-                "recent_interval_trend": "ascending_consolidation",
-                "momentum_oscillator_rsi_15m": 54.2,
-                "order_book_depth_ratio_bids_vs_asks": "1.18x (slight net buying pressure)",
-                "mean_reversion_bias": "low_probability_of_mean_reversion_within_current_bracket",
-            },
-            "sentiment_and_social_signals": {
-                "analyst_sentiment": "moderately_bullish (62% net positive)",
-                "liquidation_cluster": "dense short liquidation pools 0.8% above current level",
-                "social_media_prediction_consensus": "continuation expected into interval close",
-            },
-            "weights_and_biases": {
-                "momentum_weight": 0.35,
-                "order_flow_imbalance_weight": 0.30,
-                "volatility_decay_weight": 0.20,
-                "sentiment_bias": 0.15,
-            },
-        }
+        closes_at: datetime | None = None
+        if time_to_close is not None:
+            closes_at = datetime.now(UTC) + timedelta(seconds=time_to_close)
 
-        # Attempt to fetch live public spot price if network permits
-        try:
-            async with httpx.AsyncClient(timeout=3.0) as client:
-                res = await client.get(
-                    f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}USDT"
-                )
-                if res.status_code == 200:
-                    data = res.json()
-                    research["live_spot_reference"] = {
-                        "pair": f"{symbol}/USDT",
-                        "price": float(data.get("price", 0)),
-                        "source": "Binance Spot API",
-                    }
-        except Exception:
-            # Resilient fallback if spot feed is blocked or offline
-            research["live_spot_reference"] = {
-                "pair": f"{symbol}/USDT",
-                "note": "Spot reference inferred from verified venue CLOB book",
-            }
+        return await gather_crypto_intelligence(
+            title=title,
+            underlying_symbol=asset,
+            target_price=target_price,
+            closes_at=closes_at,
+            http_client=self._client,
+        )
 
-        return research
-
-    def _gather_sports_research(self, title: str) -> dict[str, Any]:
+    async def _gather_sports_research(self, title: str) -> dict[str, Any]:
         subject = title.strip()[:255] or "Unknown sports proposition"
+        cutoff_at = datetime.now(UTC)
+        claims: list[dict[str, Any]] = []
+        if self._client is not None:
+            claims = await PublicSportsSourceClient(self._client).search(subject, cutoff_at)
         pack = SportsEvidencePack(
             proposition_type="unclassified_sports_market",
-            cutoff_at=datetime.now(UTC),
+            cutoff_at=cutoff_at,
             subject=subject,
+            claims=claims,
             current_status="unresolved",
             resolution_definition_verified=False,
             deadline_verified=False,
             quality_flags=[
-                "SPORTS_SOURCE_ADAPTERS_NOT_CONFIGURED",
+                "PUBLIC_NEWS_AND_SOCIAL_SEARCH",
                 "SPORTS_TARGET_NOT_CLASSIFIED",
-                "NO_VERIFIED_EVIDENCE",
+                "RESOLUTION_DEFINITION_REQUIRED",
             ],
             recommendation_gate="abstain",
         )
         logger.warning(
-            "Sports research abstained: approved source-backed workflow is not configured",
+            "Sports research collected public evidence but abstained pending target verification",
             proposition=subject,
+            claim_count=len(claims),
         )
         return pack.model_dump(mode="json")
 

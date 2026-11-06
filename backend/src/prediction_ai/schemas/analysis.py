@@ -110,6 +110,14 @@ class ScreenshotMarketCandidate(BaseModel):
             # Unrecognisable text — treat as absent rather than hard-failing
             return None
 
+    @field_validator("target_price", "displayed_underlying_price", mode="before")
+    @classmethod
+    def coerce_missing_positive_price(cls, v: object) -> object:
+        """Treat Gemini's zero sentinel as missing for optional price fields."""
+        if v == 0 or v == 0.0 or v == "0" or v == "0.0":
+            return None
+        return v
+
 
 class AnalysisCreateRequest(BaseModel):
     """Payload to trigger an analysis from an existing uploaded asset."""
@@ -287,4 +295,6 @@ class AnalysisFeedbackResponse(BaseModel):
     prediction_made: str
     postmortem_analysis: str
     key_learnings: list[str]
+    discrepancy_classification: str | None = None
+    visual_observations: str | None = None
     created_at: datetime

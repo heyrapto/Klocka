@@ -31,11 +31,11 @@ export function BrandLockup({ compact = false }: { compact?: boolean }) {
       {compact ? null : (
         <div className="min-w-0">
           <div className="flex items-baseline gap-1.5">
-            <span className="text-[15px] font-semibold tracking-[-0.02em] text-zinc-50">Vector</span>
+            <span className="font-brand text-[19px] leading-none tracking-[-0.01em] text-zinc-50">Klocka</span>
             <span className="mono text-[8px] uppercase tracking-[0.16em] text-sky-400/80">v1.0</span>
           </div>
           <p className="truncate text-[9px] uppercase tracking-[0.14em] text-zinc-500">
-            Prediction intelligence
+            Prediction
           </p>
         </div>
       )}

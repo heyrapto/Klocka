@@ -1,0 +1,231 @@
+{
+  "registry_version": "sources-v1",
+  "sources": [
+    {
+      "source_id": "gdelt-doc-api",
+      "provider_key": "gdelt_project",
+      "domain_pattern": "api.gdeltproject.org",
+      "source_type": "aggregator",
+      "allowed_market_types": [
+        "manager_departure_by_deadline",
+        "appointment_by_deadline",
+        "match_result",
+        "policy_announcement"
+      ],
+      "claim_categories": [
+        "reported_news",
+        "official_statement",
+        "manager_departure",
+        "appointment"
+      ],
+      "access_method": "official_api",
+      "commercial_use_status": "approval_required",
+      "terms_url": "https://blog.gdeltproject.org/gdelt-doc-2-0-api-debuts/",
+      "license_or_contract_ref": "PENDING_LEGAL_REVIEW: GDELT Project rate-limit and commercial terms must be confirmed before enabling",
+      "retention_policy": "metadata-only",
+      "max_requests_per_minute": 10,
+      "max_concurrency": 1,
+      "max_response_bytes": 2097152,
+      "default_freshness_seconds": 3600,
+      "authority_tier": 3,
+      "enabled": false,
+      "commercial_use_status_note": "Best-effort discovery only. GDELT Project rate limits apply. Not for high-volume production use without confirmed terms."
+    },
+    {
+      "source_id": "reddit-rss",
+      "provider_key": "reddit",
+      "domain_pattern": "www.reddit.com",
+      "source_type": "social",
+      "allowed_market_types": [],
+      "claim_categories": [],
+      "access_method": "rss",
+      "commercial_use_status": "prohibited",
+      "terms_url": "https://redditinc.com/policies/data-api-terms",
+      "license_or_contract_ref": "DISABLED: Reddit requires explicit commercial permission and a contract. Anonymous RSS scraping is prohibited for commercial use.",
+      "retention_policy": "none",
+      "max_requests_per_minute": 0,
+      "max_concurrency": 0,
+      "max_response_bytes": 0,
+      "default_freshness_seconds": 0,
+      "authority_tier": 5,
+      "enabled": false
+    },
+    {
+      "source_id": "google-news-rss",
+      "provider_key": "google_news",
+      "domain_pattern": "news.google.com",
+      "source_type": "aggregator",
+      "allowed_market_types": [],
+      "claim_categories": [],
+      "access_method": "rss",
+      "commercial_use_status": "approval_required",
+      "terms_url": "https://www.about.google/policies/terms/",
+      "license_or_contract_ref": "PENDING_LEGAL_REVIEW: Public RSS URL availability does not grant commercial reuse, bulk extraction, retention, or redistribution rights.",
+      "retention_policy": "none",
+      "max_requests_per_minute": 0,
+      "max_concurrency": 0,
+      "max_response_bytes": 0,
+      "default_freshness_seconds": 0,
+      "authority_tier": 4,
+      "enabled": false
+    },
+    {
+      "source_id": "polymarket-gamma-api",
+      "provider_key": "polymarket",
+      "domain_pattern": "gamma-api.polymarket.com",
+      "source_type": "official",
+      "allowed_market_types": [
+        "manager_departure_by_deadline",
+        "appointment_by_deadline",
+        "match_result",
+        "player_participation",
+        "policy_announcement"
+      ],
+      "claim_categories": [
+        "official_statement"
+      ],
+      "access_method": "official_api",
+      "commercial_use_status": "approved",
+      "terms_url": "https://polymarket.com/terms-of-use",
+      "license_or_contract_ref": "Polymarket public API for verified market data",
+      "retention_policy": "metadata-only",
+      "max_requests_per_minute": 30,
+      "max_concurrency": 2,
+      "max_response_bytes": 2097152,
+      "default_freshness_seconds": 60,
+      "authority_tier": 1,
+      "enabled": true
+    },
+    {
+      "source_id": "polymarket-clob-api",
+      "provider_key": "polymarket",
+      "domain_pattern": "clob.polymarket.com",
+      "source_type": "official",
+      "allowed_market_types": [
+        "manager_departure_by_deadline",
+        "appointment_by_deadline",
+        "match_result",
+        "player_participation",
+        "policy_announcement"
+      ],
+      "claim_categories": [
+        "official_statement"
+      ],
+      "access_method": "official_api",
+      "commercial_use_status": "approved",
+      "terms_url": "https://polymarket.com/terms-of-use",
+      "license_or_contract_ref": "Polymarket CLOB API for order-book data",
+      "retention_policy": "metadata-only",
+      "max_requests_per_minute": 30,
+      "max_concurrency": 2,
+      "max_response_bytes": 2097152,
+      "default_freshness_seconds": 10,
+      "authority_tier": 1,
+      "enabled": true
+    },
+    {
+      "source_id": "binance-spot-api",
+      "provider_key": "binance",
+      "domain_pattern": "api.binance.com",
+      "source_type": "official",
+      "allowed_market_types": [
+        "crypto_price_at_expiry",
+        "crypto_above_strike",
+        "crypto_below_strike"
+      ],
+      "claim_categories": [
+        "price_data",
+        "ohlcv",
+        "order_book"
+      ],
+      "access_method": "official_api",
+      "commercial_use_status": "approved",
+      "terms_url": "https://www.binance.com/en/terms",
+      "license_or_contract_ref": "Binance public REST API \u2014 no authentication required for market data endpoints",
+      "retention_policy": "none",
+      "max_requests_per_minute": 1200,
+      "max_concurrency": 5,
+      "max_response_bytes": 2097152,
+      "default_freshness_seconds": 60,
+      "authority_tier": 1,
+      "enabled": true
+    },
+    {
+      "source_id": "binance-futures-api",
+      "provider_key": "binance",
+      "domain_pattern": "fapi.binance.com",
+      "source_type": "official",
+      "allowed_market_types": [
+        "crypto_price_at_expiry",
+        "crypto_above_strike",
+        "crypto_below_strike"
+      ],
+      "claim_categories": [
+        "funding_rate",
+        "open_interest",
+        "derivatives_data"
+      ],
+      "access_method": "official_api",
+      "commercial_use_status": "approved",
+      "terms_url": "https://www.binance.com/en/terms",
+      "license_or_contract_ref": "Binance USD-M Futures public REST API \u2014 no auth required for market data",
+      "retention_policy": "none",
+      "max_requests_per_minute": 1200,
+      "max_concurrency": 5,
+      "max_response_bytes": 2097152,
+      "default_freshness_seconds": 30,
+      "authority_tier": 1,
+      "enabled": true
+    },
+    {
+      "source_id": "alternative-me-fng",
+      "provider_key": "alternative_me",
+      "domain_pattern": "api.alternative.me",
+      "source_type": "aggregator",
+      "allowed_market_types": [
+        "crypto_price_at_expiry",
+        "crypto_above_strike",
+        "crypto_below_strike"
+      ],
+      "claim_categories": [
+        "sentiment"
+      ],
+      "access_method": "official_api",
+      "commercial_use_status": "approved",
+      "terms_url": "https://alternative.me/crypto/fear-and-greed-index/",
+      "license_or_contract_ref": "Alternative.me Fear & Greed Index \u2014 public API, free for non-commercial and commercial use",
+      "retention_policy": "none",
+      "max_requests_per_minute": 10,
+      "max_concurrency": 1,
+      "max_response_bytes": 65536,
+      "default_freshness_seconds": 3600,
+      "authority_tier": 3,
+      "enabled": true
+    },
+    {
+      "source_id": "coinbase-spot-api",
+      "provider_key": "coinbase",
+      "domain_pattern": "api.coinbase.com",
+      "source_type": "official",
+      "allowed_market_types": [
+        "crypto_price_at_expiry",
+        "crypto_above_strike",
+        "crypto_below_strike"
+      ],
+      "claim_categories": [
+        "price_data"
+      ],
+      "access_method": "official_api",
+      "commercial_use_status": "approved",
+      "terms_url": "https://www.coinbase.com/legal/user_agreement",
+      "license_or_contract_ref": "Coinbase public REST API for spot ticker data",
+      "retention_policy": "none",
+      "max_requests_per_minute": 600,
+      "max_concurrency": 3,
+      "max_response_bytes": 65536,
+      "default_freshness_seconds": 30,
+      "authority_tier": 1,
+      "enabled": true
+    }
+  ]
+}

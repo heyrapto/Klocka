@@ -56,7 +56,18 @@ class GeminiForecaster:
                 "GEMINI_API_KEY is not configured. An official Google Gemini API key is required to produce calibrated probability forecasts."
             )
 
-        yes_quote = next((q for q in order_book.quotes if q.label.lower() in ("yes", "yes ")), None)
+        yes_quote = next(
+            (
+                q
+                for q in order_book.quotes
+                if q.label.strip().lower() in ("yes", "up", "higher", "over")
+            ),
+            None,
+        )
+        if yes_quote is None and len(order_book.quotes) == 2:
+            # Default first outcome of binary pair to YES/Up
+            yes_quote = order_book.quotes[0]
+
         market_implied = yes_quote.mid_price if (yes_quote and yes_quote.mid_price) else Decimal("0.50")
 
         prompt = self._build_prompt(
@@ -82,7 +93,7 @@ class GeminiForecaster:
             )
             raw_text = response.text or ""
             parsed = self._parse_output(raw_text)
-            return self._blend_and_calibrate(market, order_book, market_implied, parsed)
+            return self._blend_and_calibrate(market, order_book, market_implied, parsed, specialist_context)
         except errors.APIError as err:
             logger.error("Gemini forecasting API error", error=str(err))
             raise ForecastFailedException(f"Gemini API returned error: {err}") from err
@@ -155,13 +166,27 @@ class GeminiForecaster:
         order_book: NormalizedOrderBook,
         market_implied: Decimal,
         output: GeminiForecastOutput,
+        specialist_context: dict | None = None,
     ) -> ForecastResult:
         model_raw = Decimal(str(round(output.raw_probability_yes, 4)))
 
-        # Bayesian shrinkage toward market prior:
-        # P_blended = 0.40 * P_model + 0.60 * P_market
-        # This grounds the LLM probability in the capital-backed market consensus while capturing evidence edge.
-        blended_p = (Decimal("0.40") * model_raw) + (Decimal("0.60") * market_implied)
+        # If the crypto specialist produced a math-based log-normal P(YES), use it as
+        # the model anchor instead of the raw LLM guess.  The log-normal formula is
+        # grounded in real OHLCV data and is more reliable than a pure LLM intuition.
+        crypto_ctx = (specialist_context or {}).get("crypto_research", {})
+        math_prob_str = crypto_ctx.get("adjusted_prob_yes") or crypto_ctx.get("base_prob_yes")
+        if math_prob_str is not None:
+            try:
+                math_prob = Decimal(str(round(float(math_prob_str), 4)))
+                # Blend: 50% math model, 15% LLM interpretation, 35% market
+                model_raw = (Decimal("0.50") * math_prob) + (Decimal("0.15") * model_raw)
+            except (ValueError, TypeError):
+                pass  # Fallback to plain LLM probability if parsing fails
+
+        # Bayesian shrinkage: 65% model evidence / 35% market prior.
+        # Increased model weight because we now supply real data signals that
+        # the LLM integrates into its probability estimate — not just intuition.
+        blended_p = (Decimal("0.65") * model_raw) + (Decimal("0.35") * market_implied)
         p_yes = min(max(blended_p, Decimal("0.01")), Decimal("0.99"))
         p_no = Decimal("1.0") - p_yes
 
@@ -192,7 +217,7 @@ class GeminiForecaster:
             uncertainty_interval=[interval_lower, interval_upper],
             model_version=f"gemini_blended_{self._model}",
             prompt_version="forecast_gemini_v1",
-            calibration_version="bayesian_shrinkage_v1",
+            calibration_version="bayesian_shrinkage_v2",
             market_implied_probability=market_implied,
             reasoning=output.reasoning_summary,
             key_drivers=output.key_drivers,

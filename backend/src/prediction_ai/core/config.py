@@ -127,6 +127,17 @@ class Settings(BaseSettings):
     RESEARCH_ENABLED: bool = False
 
     # ------------------------------------------------------------------
+    # Research runtime
+    # ------------------------------------------------------------------
+    RESEARCH_SOURCES_REGISTRY_PATH: str = "config/sources_registry.json"
+    RESEARCH_JOB_TIMEOUT_SECONDS: int = Field(default=300, gt=0)
+    RESEARCH_JOB_SOFT_TIME_LIMIT_SECONDS: int = Field(default=240, gt=0)
+    RESEARCH_MAX_DOCUMENTS: int = Field(default=20, ge=1, le=200)
+    RESEARCH_MAX_CLAIMS_PER_DOC: int = Field(default=10, ge=1, le=100)
+    RESEARCH_OUTBOX_POLL_INTERVAL_SECONDS: float = Field(default=5.0, gt=0.0)
+    RESEARCH_OUTBOX_BATCH_SIZE: int = Field(default=20, ge=1, le=100)
+
+    # ------------------------------------------------------------------
     # Decision policy
     # ------------------------------------------------------------------
     DECISION_MIN_EDGE: float = Field(default=0.04, ge=0.0, le=1.0)
