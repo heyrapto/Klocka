@@ -24,6 +24,7 @@ class SpecialistResearchService:
         title: str,
         time_to_close_seconds: float | None = None,
         target_price: float | None = None,
+        displayed_underlying_price: float | None = None,
     ) -> dict[str, Any]:
         """Gather domain-specific research context based on market category."""
         sqlite = get_sqlite_db()
@@ -45,7 +46,11 @@ class SpecialistResearchService:
 
         if category == "crypto":
             context["crypto_research"] = await self._gather_crypto_research(
-                asset, title, time_to_close_seconds, target_price=target_price
+                asset,
+                title,
+                time_to_close_seconds,
+                target_price=target_price,
+                displayed_spot_price=displayed_underlying_price,
             )
         elif category == "sports":
             context["sports_research"] = await self._gather_sports_research(title)
@@ -60,6 +65,7 @@ class SpecialistResearchService:
         title: str,
         time_to_close: float | None,
         target_price: float | None = None,
+        displayed_spot_price: float | None = None,
     ) -> dict[str, Any]:
         """Gather real crypto intelligence: OHLCV, order-book, derivatives signals,
         Fear & Greed, and a mathematically grounded log-normal P(YES)."""
@@ -75,6 +81,7 @@ class SpecialistResearchService:
             title=title,
             underlying_symbol=asset,
             target_price=target_price,
+            displayed_spot_price=displayed_spot_price,
             closes_at=closes_at,
             http_client=self._client,
         )

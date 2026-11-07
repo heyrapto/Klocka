@@ -8,6 +8,7 @@ interface IntervalTimerProps {
   pipelineLatencySeconds?: number | null;
   initialSecondsRemaining?: number | null;
   decisionSecondsRemaining?: number | null;
+  onScrollToSettlement?: () => void;
 }
 
 function formatDuration(totalSeconds: number): string {
@@ -27,6 +28,7 @@ export function IntervalTimer({
   pipelineLatencySeconds,
   initialSecondsRemaining,
   decisionSecondsRemaining,
+  onScrollToSettlement,
 }: IntervalTimerProps) {
   const [secondsRemaining, setSecondsRemaining] = useState<number | null>(() => {
     if (!resolvesAt) return decisionSecondsRemaining ?? null;
@@ -109,17 +111,36 @@ export function IntervalTimer({
         </div>
       </div>
 
-      {pipelineLatencySeconds != null && (
-        <div className="flex items-center gap-1.5 rounded-lg border border-line/70 bg-raised/50 px-2.5 py-1 text-[11px] font-mono text-zinc-600">
-          <Zap className="size-3 text-amber-500" />
-          <span>Latency: {pipelineLatencySeconds.toFixed(1)}s</span>
-          {initialSecondsRemaining != null && (
-            <span className="text-zinc-500">
-              ({formatDuration(initialSecondsRemaining)} at capture)
-            </span>
-          )}
-        </div>
-      )}
+      <div className="flex flex-wrap items-center gap-2">
+        {pipelineLatencySeconds != null && (
+          <div className="flex items-center gap-1.5 rounded-lg border border-line/70 bg-raised/50 px-2.5 py-1 text-[11px] font-mono text-zinc-600">
+            <Zap className="size-3 text-amber-500" />
+            <span>Latency: {pipelineLatencySeconds.toFixed(1)}s</span>
+            {initialSecondsRemaining != null && (
+              <span className="text-zinc-500">
+                ({formatDuration(initialSecondsRemaining)} at capture)
+              </span>
+            )}
+          </div>
+        )}
+
+        {isExpired && (
+          <button
+            type="button"
+            onClick={() => {
+              if (onScrollToSettlement) {
+                onScrollToSettlement();
+              } else {
+                document.getElementById("settlement-training")?.scrollIntoView({ behavior: "smooth" });
+              }
+            }}
+            className="inline-flex items-center gap-1.5 rounded-lg bg-violet-600 px-3 py-1.5 text-xs font-semibold text-white shadow-sm hover:bg-violet-700 transition-all cursor-pointer"
+          >
+            <span>🎯</span>
+            <span>Settle &amp; Train AI</span>
+          </button>
+        )}
+      </div>
     </div>
   );
 }

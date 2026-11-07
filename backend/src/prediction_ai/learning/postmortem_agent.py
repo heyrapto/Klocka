@@ -119,18 +119,22 @@ async def run_postmortem_analysis(
 ) -> PostmortemResult:
     """Execute causal diagnostic reflection and produce structured learnings."""
 
-    # Determine correctness
+    # Determine correctness with flexible binary mapping (YES/NO, UP/DOWN, HIGHER/LOWER)
+    norm_outcome = actual_outcome.strip().upper()
+    is_affirmative_outcome = norm_outcome in ("YES", "UP", "HIGHER", "BUY_UP", "BUY UP")
+    is_negative_outcome = norm_outcome in ("NO", "DOWN", "LOWER", "BUY_DOWN", "BUY DOWN")
+
     was_correct = False
-    if recommendation == "BUY_YES" and actual_outcome == "YES":
+    if recommendation in ("BUY_YES", "BUY_UP") and is_affirmative_outcome:
         was_correct = True
-    elif recommendation == "BUY_NO" and actual_outcome == "NO":
+    elif recommendation in ("BUY_NO", "BUY_DOWN") and is_negative_outcome:
         was_correct = True
     elif recommendation == "NO_TRADE":
         # Abstention is considered aligned if edge was thin or market was a coin toss
         was_correct = True
 
     # Compute Brier score component: (probability_yes - outcome_indicator)^2
-    outcome_indicator = 1.0 if actual_outcome == "YES" else 0.0
+    outcome_indicator = 1.0 if is_affirmative_outcome else 0.0
     brier_loss = round((probability_yes - outcome_indicator) ** 2, 4)
 
     # Check if Gemini API is configured for deep generative reflection

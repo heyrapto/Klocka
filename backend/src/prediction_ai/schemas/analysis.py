@@ -278,7 +278,7 @@ class AnalysisFeedbackRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    actual_outcome: Literal["YES", "NO"]
+    actual_outcome: Literal["YES", "NO", "UP", "DOWN", "HIGHER", "LOWER", "BUY UP", "BUY DOWN"] | str
     notes: str | None = Field(default=None, max_length=2000)
     settled_price: Decimal | None = Field(default=None, ge=0, le=1)
 
@@ -298,3 +298,22 @@ class AnalysisFeedbackResponse(BaseModel):
     discrepancy_classification: str | None = None
     visual_observations: str | None = None
     created_at: datetime
+
+
+class AssetCalibrationResponse(BaseModel):
+    """Calibrated statistical parameters and learning weights for an asset."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    symbol: str
+    category: str
+    sample_count: int
+    correct_count: int
+    win_rate: float | None = None
+    brier_score: float
+    vol_multiplier: float
+    momentum_weight: float
+    order_flow_weight: float
+    uncertainty_margin: float
+    last_discrepancy_reason: str | None = None
+    updated_at: datetime

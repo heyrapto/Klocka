@@ -39,6 +39,7 @@ from prediction_ai.schemas.analysis import (
     AnalysisErrorInfo,
     AnalysisFeedbackRequest,
     AnalysisFeedbackResponse,
+    AssetCalibrationResponse,
     EventEnvelope,
     MarketConfirmationRequest,
 )
@@ -176,6 +177,88 @@ async def create_analysis(
         status="RECEIVED",
         status_url=f"/api/v1/analyses/{analysis_id}",
         events_url=f"/api/v1/analyses/{analysis_id}/events",
+    )
+
+
+@router.get("/calibrations", response_model=list[AssetCalibrationResponse])
+async def list_calibrations(
+    category: str | None = None,
+    sqlite: SQLiteStore = Depends(get_sqlite),
+) -> list[AssetCalibrationResponse]:
+    """List all tracked asset calibrations ordered by sample count."""
+    rows = await sqlite.list_asset_calibrations(category=category)
+    results: list[AssetCalibrationResponse] = []
+    for cal in rows:
+        sample_count = cal.get("sample_count", 0)
+        correct_count = cal.get("correct_count", 0)
+        win_rate = (correct_count / sample_count) if sample_count > 0 else None
+
+        updated_at_val = cal.get("updated_at")
+        if isinstance(updated_at_val, str):
+            try:
+                updated_dt = datetime.fromisoformat(updated_at_val)
+            except Exception:
+                updated_dt = datetime.now(UTC)
+        elif isinstance(updated_at_val, datetime):
+            updated_dt = updated_at_val
+        else:
+            updated_dt = datetime.now(UTC)
+
+        results.append(
+            AssetCalibrationResponse(
+                symbol=cal["symbol"],
+                category=cal.get("category", "crypto"),
+                sample_count=sample_count,
+                correct_count=correct_count,
+                win_rate=round(win_rate, 4) if win_rate is not None else None,
+                brier_score=round(cal.get("brier_score", 0.25), 4),
+                vol_multiplier=round(cal.get("vol_multiplier", 1.0), 3),
+                momentum_weight=round(cal.get("momentum_weight", 0.35), 3),
+                order_flow_weight=round(cal.get("order_flow_weight", 0.30), 3),
+                uncertainty_margin=round(cal.get("uncertainty_margin", 0.02), 4),
+                last_discrepancy_reason=cal.get("last_discrepancy_reason"),
+                updated_at=updated_dt,
+            )
+        )
+    return results
+
+
+@router.get("/calibration/{symbol}", response_model=AssetCalibrationResponse)
+async def get_symbol_calibration(
+    symbol: str,
+    category: str = "crypto",
+    sqlite: SQLiteStore = Depends(get_sqlite),
+) -> AssetCalibrationResponse:
+    """Retrieve statistical calibration profile and learning weights for a specific asset."""
+    cal = await sqlite.get_asset_calibration(symbol=symbol, category=category)
+    sample_count = cal.get("sample_count", 0)
+    correct_count = cal.get("correct_count", 0)
+    win_rate = (correct_count / sample_count) if sample_count > 0 else None
+
+    updated_at_val = cal.get("updated_at")
+    if isinstance(updated_at_val, str):
+        try:
+            updated_dt = datetime.fromisoformat(updated_at_val)
+        except Exception:
+            updated_dt = datetime.now(UTC)
+    elif isinstance(updated_at_val, datetime):
+        updated_dt = updated_at_val
+    else:
+        updated_dt = datetime.now(UTC)
+
+    return AssetCalibrationResponse(
+        symbol=cal["symbol"],
+        category=cal["category"],
+        sample_count=sample_count,
+        correct_count=correct_count,
+        win_rate=round(win_rate, 4) if win_rate is not None else None,
+        brier_score=round(cal.get("brier_score", 0.25), 4),
+        vol_multiplier=round(cal.get("vol_multiplier", 1.0), 3),
+        momentum_weight=round(cal.get("momentum_weight", 0.35), 3),
+        order_flow_weight=round(cal.get("order_flow_weight", 0.30), 3),
+        uncertainty_margin=round(cal.get("uncertainty_margin", 0.02), 4),
+        last_discrepancy_reason=cal.get("last_discrepancy_reason"),
+        updated_at=updated_dt,
     )
 
 
@@ -580,6 +663,171 @@ async def submit_analysis_feedback(
         prediction_made=prediction_made,
         postmortem_analysis=postmortem_analysis,
         visual_observations=postmortem.visual_observations,
+        discrepancy_classification=postmortem.discrepancy_classification,
+        key_learnings=key_learnings,
+        created_at=now_dt,
+    )
+
+
+@router.post(
+    "/{analysis_id}/auto-settle",
+    response_model=AnalysisFeedbackResponse,
+    summary="Automatically resolve contract settlement and trigger causal postmortem learning",
+)
+async def auto_settle_analysis(
+    analysis_id: UUID,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+    sqlite: SQLiteStore = Depends(get_sqlite),
+    settings: Settings = Depends(get_settings),
+) -> AnalysisFeedbackResponse:
+    """Fetch spot price at resolution time, compute outcome against strike, and train AI models."""
+    doc = await sqlite.get_analysis(str(analysis_id))
+    if doc is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Analysis not found")
+
+    forecast_doc = doc.get("forecast") or {}
+    recommendation = forecast_doc.get("recommendation", "NO_TRADE")
+    market_data = forecast_doc.get("market") or {}
+    market_title = market_data.get("title") or "Unknown Market"
+    category = market_data.get("category") or "crypto"
+    symbol = market_data.get("underlying_symbol") or "BTC"
+    prob_yes = float(forecast_doc.get("probability_yes", 0.5))
+    prediction_made = f"{recommendation} (P(YES)={prob_yes:.2f})"
+
+    specialist_context = doc.get("specialist_context") or forecast_doc.get("specialist_context") or {}
+    crypto_res = specialist_context.get("crypto_research") or {}
+
+    extraction_res = doc.get("extraction_result") or {}
+    strike_price = None
+    if crypto_res.get("strike") is not None:
+        strike_price = float(crypto_res["strike"])
+    elif extraction_res.get("target_price") is not None:
+        strike_price = float(extraction_res["target_price"])
+
+    if strike_price is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot auto-settle: strike target price is unknown for this contract",
+        )
+
+    direction = crypto_res.get("direction") or "above"
+
+    # Determine resolution anchor
+    resolves_at_dt = None
+    timing_prov = forecast_doc.get("timing_provenance") or {}
+    if timing_prov.get("exact_resolves_at"):
+        try:
+            resolves_at_dt = datetime.fromisoformat(timing_prov["exact_resolves_at"])
+        except Exception:
+            pass
+
+    from prediction_ai.specialists.crypto.settlement import (
+        determine_binary_outcome,
+        fetch_crypto_settlement_price,
+    )
+
+    settled_price = await fetch_crypto_settlement_price(symbol, target_time=resolves_at_dt)
+    if settled_price is None:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Could not retrieve live spot price for {symbol} to auto-settle",
+        )
+
+    label_positive = "YES"
+    label_negative = "NO"
+    extracted_outcomes = extraction_res.get("outcomes") or []
+    if extracted_outcomes and len(extracted_outcomes) >= 2:
+        l0 = str(extracted_outcomes[0].get("label", "")).strip().upper()
+        if "UP" in l0 or "HIGH" in l0:
+            label_positive = "UP"
+            label_negative = "DOWN"
+    elif category == "crypto":
+        label_positive = "UP"
+        label_negative = "DOWN"
+
+    actual_outcome = determine_binary_outcome(
+        strike_price=strike_price,
+        settled_price=settled_price,
+        direction=direction,
+        label_positive=label_positive,
+        label_negative=label_negative,
+    )
+
+    from prediction_ai.learning.postmortem_agent import run_postmortem_analysis
+
+    notes = f"Auto-settled via live ticker feed: {symbol} spot at ${settled_price:,.2f} vs strike ${strike_price:,.2f} ({direction})."
+
+    postmortem = await run_postmortem_analysis(
+        market_title=market_title,
+        category=category,
+        symbol=symbol,
+        recommendation=recommendation,
+        probability_yes=prob_yes,
+        actual_outcome=actual_outcome,
+        settled_price=settled_price,
+        strike_price=strike_price,
+        user_notes=notes,
+        specialist_context=specialist_context,
+        settings=settings,
+    )
+
+    was_correct = postmortem.was_correct
+    postmortem_analysis = postmortem.postmortem_analysis
+    key_learnings = postmortem.key_learnings
+
+    await sqlite.update_asset_calibration(
+        symbol=symbol,
+        category=category,
+        was_correct=was_correct,
+        brier_loss=postmortem.brier_loss,
+        vol_multiplier_delta=postmortem.vol_multiplier_delta,
+        momentum_weight_delta=postmortem.momentum_weight_delta,
+        order_flow_weight_delta=postmortem.order_flow_weight_delta,
+        uncertainty_margin_delta=postmortem.uncertainty_margin_delta,
+        reason=postmortem.discrepancy_classification,
+    )
+
+    feedback_id = uuid4()
+    now_dt = datetime.now(UTC)
+    feedback_doc = {
+        "id": str(feedback_id),
+        "feedback_id": str(feedback_id),
+        "analysis_id": str(analysis_id),
+        "user_id": str(current_user.id),
+        "category": category,
+        "market_title": market_title,
+        "recommendation": recommendation,
+        "actual_outcome": actual_outcome,
+        "was_correct": was_correct,
+        "settled_price": settled_price,
+        "user_notes": notes,
+        "postmortem_analysis": postmortem_analysis,
+        "visual_observations": None,
+        "key_learnings": key_learnings,
+        "discrepancy_classification": postmortem.discrepancy_classification,
+        "brier_loss": postmortem.brier_loss,
+        "has_settlement_screenshot": False,
+        "created_at": now_dt.isoformat(),
+    }
+    await sqlite.record_feedback(feedback_doc)
+
+    logger.info(
+        "Auto-settled analysis successfully",
+        analysis_id=str(analysis_id),
+        settled_price=settled_price,
+        strike_price=strike_price,
+        actual_outcome=actual_outcome,
+        was_correct=was_correct,
+    )
+
+    return AnalysisFeedbackResponse(
+        feedback_id=feedback_id,
+        analysis_id=analysis_id,
+        actual_outcome=actual_outcome,
+        was_correct=was_correct,
+        prediction_made=prediction_made,
+        postmortem_analysis=postmortem_analysis,
+        visual_observations=None,
         discrepancy_classification=postmortem.discrepancy_classification,
         key_learnings=key_learnings,
         created_at=now_dt,

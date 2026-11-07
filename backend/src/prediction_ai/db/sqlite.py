@@ -113,6 +113,9 @@ class SQLiteStore:
                 user_notes TEXT,
                 postmortem_analysis TEXT,
                 key_learnings TEXT,
+                visual_observations TEXT,
+                discrepancy_classification TEXT,
+                brier_loss REAL,
                 created_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_feedback_category ON feedback(category, created_at);
@@ -132,6 +135,17 @@ class SQLiteStore:
                 PRIMARY KEY (symbol, category)
             );
             """)
+
+            # Add supplemental columns if feedback table was created by an older migration
+            for col, col_type in [
+                ("visual_observations", "TEXT"),
+                ("discrepancy_classification", "TEXT"),
+                ("brier_loss", "REAL"),
+            ]:
+                try:
+                    conn.execute(f"ALTER TABLE feedback ADD COLUMN {col} {col_type}")
+                except Exception:
+                    pass
         self._initialized = True
         logger.info("SQLite database initialized successfully", db_path=self.db_path)
 
@@ -418,8 +432,9 @@ class SQLiteStore:
                 INSERT INTO feedback (
                     feedback_id, analysis_id, user_id, category, market_title,
                     recommendation, actual_outcome, was_correct, settled_price,
-                    user_notes, postmortem_analysis, key_learnings, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    user_notes, postmortem_analysis, key_learnings,
+                    visual_observations, discrepancy_classification, brier_loss, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     feedback_id,
@@ -434,6 +449,9 @@ class SQLiteStore:
                     doc.get("user_notes"),
                     doc.get("postmortem_analysis"),
                     json.dumps(doc.get("key_learnings", [])),
+                    doc.get("visual_observations"),
+                    doc.get("discrepancy_classification"),
+                    float(doc.get("brier_loss")) if doc.get("brier_loss") is not None else None,
                     doc["created_at"],
                 ),
             )
@@ -570,6 +588,22 @@ class SQLiteStore:
             vol_multiplier_delta, momentum_weight_delta,
             order_flow_weight_delta, uncertainty_margin_delta, reason,
         )
+
+    def _list_asset_calibrations_sync(self, category: str | None = None) -> list[dict[str, Any]]:
+        with self._get_connection() as conn:
+            if category:
+                cursor = conn.execute(
+                    "SELECT * FROM asset_calibration WHERE category = ? ORDER BY sample_count DESC, updated_at DESC",
+                    (category.lower(),),
+                )
+            else:
+                cursor = conn.execute(
+                    "SELECT * FROM asset_calibration ORDER BY sample_count DESC, updated_at DESC"
+                )
+            return [dict(row) for row in cursor.fetchall()]
+
+    async def list_asset_calibrations(self, category: str | None = None) -> list[dict[str, Any]]:
+        return await anyio.to_thread.run_sync(self._list_asset_calibrations_sync, category)
 
 
 _sqlite_store: SQLiteStore | None = None

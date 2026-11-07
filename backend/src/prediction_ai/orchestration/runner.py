@@ -437,12 +437,14 @@ class AnalysisWorkflowRunner:
 
         category = best_market.category if best_market.category and best_market.category != "unknown" else "crypto"
         target_price_float = float(candidate.target_price) if candidate.target_price is not None else None
+        displayed_price_float = float(candidate.displayed_underlying_price) if candidate.displayed_underlying_price is not None else None
         specialist_context = await specialist_service.gather_context(
             category=category,
             asset=best_market.underlying_symbol or candidate.asset_or_entity,
             title=best_market.title,
             time_to_close_seconds=time_to_close,
             target_price=target_price_float,
+            displayed_underlying_price=displayed_price_float,
         )
 
         screenshot_observation = candidate.model_dump(

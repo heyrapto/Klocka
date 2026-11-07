@@ -12,11 +12,14 @@ import {
   RefreshCw,
   Scale,
   ShieldCheck,
+  Sparkles,
   TrendingDown,
   TrendingUp,
   Upload,
   XCircle,
+  Zap,
 } from "lucide-react";
+import { CalibrationCard } from "@/components/analyses/calibration-card";
 import { IntervalTimer } from "@/components/analyses/interval-timer";
 
 interface DecisionMetrics {
@@ -49,6 +52,7 @@ interface MarketSummary {
   title: string;
   url?: string | null;
   category: string;
+  underlying_symbol?: string | null;
   resolves_at?: string | null;
   resolution_source?: string | null;
 }
@@ -107,6 +111,8 @@ interface AnalysisDetail {
     asset_or_entity?: string;
     overall_confidence?: number;
     extraction_warnings?: string[];
+    outcomes?: Array<{ label?: string; displayed_price?: number }> | null;
+    [key: string]: unknown;
   } | null;
   verification?: {
     status?: string;
@@ -202,9 +208,11 @@ export default function PredictionMarketHome() {
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   // Post-settlement feedback state
-  const [feedbackOutcome, setFeedbackOutcome] = useState<"YES" | "NO">("YES");
+  const [feedbackOutcome, setFeedbackOutcome] = useState<string>("UP");
   const [feedbackNotes, setFeedbackNotes] = useState("");
   const [submittingFeedback, setSubmittingFeedback] = useState(false);
+  const [autoSettling, setAutoSettling] = useState(false);
+  const [calibrationCounter, setCalibrationCounter] = useState(0);
   const [feedbackResult, setFeedbackResult] = useState<FeedbackResult | null>(null);
   const [feedbackError, setFeedbackError] = useState<string | null>(null);
   const [settlementFile, setSettlementFile] = useState<File | null>(null);
@@ -216,6 +224,22 @@ export default function PredictionMarketHome() {
   // Highest pipeline step confirmed by server events so the bar never regresses
   // (guards against late SSE replays or unknown stage names).
   const progressStepRef = useRef(0);
+
+  // Restore active analysis session on page refresh so user never loses their forecast
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const urlId = params.get("id") || params.get("analysis_id");
+      const activeId = urlId || localStorage.getItem("klocka_active_analysis_id");
+      if (activeId && !analysisId) {
+        setAnalysisId(activeId);
+        fetchFinalResult(activeId);
+      }
+    } catch (err) {
+      console.debug("Session restore skipped", err);
+    }
+  }, []);
 
   const advanceStage = (stage: string) => {
     const step = STAGE_INFO[stage]?.step ?? 0;
@@ -247,6 +271,13 @@ export default function PredictionMarketHome() {
   const resetAnalysis = () => {
     if (eventSourceRef.current) {
       eventSourceRef.current.close();
+      eventSourceRef.current = null;
+    }
+    if (typeof window !== "undefined") {
+      try {
+        localStorage.removeItem("klocka_active_analysis_id");
+        window.history.replaceState(null, "", window.location.pathname);
+      } catch {}
     }
     setFile(null);
     setPreviewUrl(null);
@@ -300,6 +331,14 @@ export default function PredictionMarketHome() {
 
       const data = await res.json();
       setAnalysisId(data.analysis_id);
+
+      // Persist active analysis ID so session survives page reloads and tab closures
+      if (typeof window !== "undefined") {
+        try {
+          localStorage.setItem("klocka_active_analysis_id", data.analysis_id);
+          window.history.replaceState(null, "", `?id=${data.analysis_id}`);
+        } catch {}
+      }
 
       const eventsUrl = data.events_url.startsWith("http")
         ? data.events_url
@@ -451,10 +490,33 @@ export default function PredictionMarketHome() {
       }
       const data = await res.json();
       setFeedbackResult(data);
+      setCalibrationCounter((c) => c + 1);
     } catch (err: unknown) {
       setFeedbackError(err instanceof Error ? err.message : "Error submitting feedback");
     } finally {
       setSubmittingFeedback(false);
+    }
+  };
+
+  const autoSettleTrade = async () => {
+    if (!analysisId) return;
+    setAutoSettling(true);
+    setFeedbackError(null);
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/analyses/${analysisId}/auto-settle`, {
+        method: "POST",
+      });
+      if (!res.ok) {
+        const errJson = await res.json().catch(() => ({}));
+        throw new Error(errJson.detail || "Auto-settlement failed. You can still report settlement manually below.");
+      }
+      const data = await res.json();
+      setFeedbackResult(data);
+      setCalibrationCounter((c) => c + 1);
+    } catch (err: unknown) {
+      setFeedbackError(err instanceof Error ? err.message : "Error auto-settling trade");
+    } finally {
+      setAutoSettling(false);
     }
   };
 
@@ -472,6 +534,25 @@ export default function PredictionMarketHome() {
   const progressPercent = stageMeta
     ? Math.round((stageMeta.step / TOTAL_PIPELINE_STAGES) * 100)
     : 0;
+
+  // Dynamic outcome terminology: adapt for crypto (BUY UP / BUY DOWN) vs binary (BUY YES / BUY NO)
+  const rawOutcomes = analysisDetail?.extraction?.outcomes;
+  const outcomeLabels: string[] = Array.isArray(rawOutcomes)
+    ? rawOutcomes.map((o: unknown) => {
+        if (typeof o === "string") return o;
+        if (typeof o === "object" && o && "label" in o) return String((o as { label?: string }).label || "");
+        return "";
+      })
+    : [];
+
+  const isUpMarket =
+    outcomeLabels.some((l) => /up|higher/i.test(l)) ||
+    forecast?.market?.category === "crypto";
+
+  const affirmativeLabel = isUpMarket ? "UP" : "YES";
+  const negativeLabel = isUpMarket ? "DOWN" : "NO";
+  const buyAffirmativeText = isUpMarket ? "BUY UP" : "BUY YES";
+  const buyNegativeText = isUpMarket ? "BUY DOWN" : "BUY NO";
 
   // Determine which UX state to render:
   // State 1: "upload" (idle, no analysis running, no results)
@@ -759,6 +840,9 @@ export default function PredictionMarketHome() {
                     pipelineLatencySeconds={forecast.timing_provenance?.pipeline_latency_seconds}
                     initialSecondsRemaining={forecast.timing_provenance?.initial_seconds_remaining}
                     decisionSecondsRemaining={forecast.timing_provenance?.decision_seconds_remaining}
+                    onScrollToSettlement={() => {
+                      document.getElementById("settlement-training")?.scrollIntoView({ behavior: "smooth" });
+                    }}
                   />
                 )}
 
@@ -772,13 +856,13 @@ export default function PredictionMarketHome() {
                       {forecast.recommendation === "BUY_YES" && (
                         <span className="flex items-center gap-1.5 rounded-full border border-emerald-200 bg-emerald-50 px-3.5 py-1 text-sm font-bold tracking-wide text-emerald-700">
                           <TrendingUp className="size-4" />
-                          BUY YES
+                          {buyAffirmativeText}
                         </span>
                       )}
                       {forecast.recommendation === "BUY_NO" && (
                         <span className="flex items-center gap-1.5 rounded-full border border-rose-200 bg-rose-50 px-3.5 py-1 text-sm font-bold tracking-wide text-rose-700">
                           <TrendingDown className="size-4" />
-                          BUY NO
+                          {buyNegativeText}
                         </span>
                       )}
                       {forecast.recommendation === "NO_TRADE" && (
@@ -797,7 +881,7 @@ export default function PredictionMarketHome() {
                       Calibrated Model Probability
                     </span>
                     <div className="mt-0.5 font-mono text-2xl font-bold text-zinc-900">
-                      P(YES) = {(Number(forecast.probability_yes) * 100).toFixed(1)}%
+                      P({affirmativeLabel}) = {(Number(forecast.probability_yes) * 100).toFixed(1)}%
                     </div>
                     <div className="font-mono text-[11px] text-zinc-500">
                       90% CI: [
@@ -813,10 +897,10 @@ export default function PredictionMarketHome() {
                 <div className="space-y-1.5">
                   <div className="flex justify-between text-xs font-medium">
                     <span className="text-emerald-600">
-                      YES: {(Number(forecast.probability_yes) * 100).toFixed(1)}%
+                      {affirmativeLabel}: {(Number(forecast.probability_yes) * 100).toFixed(1)}%
                     </span>
                     <span className="text-rose-600">
-                      NO: {(Number(forecast.probability_no) * 100).toFixed(1)}%
+                      {negativeLabel}: {(Number(forecast.probability_no) * 100).toFixed(1)}%
                     </span>
                   </div>
                   <div className="flex h-3 w-full overflow-hidden rounded-full bg-raised">
@@ -980,8 +1064,15 @@ export default function PredictionMarketHome() {
                   </div>
                 )}
 
+                {/* Real-time Adaptive Calibration Matrix */}
+                <CalibrationCard
+                  symbol={forecast.market?.underlying_symbol || "BTC"}
+                  apiBase={API_BASE}
+                  refreshTrigger={calibrationCounter}
+                />
+
                 {/* Continuous Improvement & Post-Settlement Feedback Cockpit */}
-                <div className="space-y-4 rounded-xl border border-line bg-raised/40 p-5">
+                <div id="settlement-training" className="space-y-4 rounded-xl border border-line bg-raised/40 p-5 scroll-mt-8">
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-2">
                       <RefreshCw className="size-4 text-accent" />
@@ -997,6 +1088,38 @@ export default function PredictionMarketHome() {
                   <p className="text-xs text-zinc-500">
                     Once the market candle closes, report whether it resolved YES or NO. The AI records postmortem learnings into SQLite memory to avoid repeating mistakes and continuously improve future accuracy.
                   </p>
+
+                  {!feedbackResult && (
+                    <div className="flex flex-col gap-2 rounded-lg border border-accent/20 bg-accent/5 p-3.5 sm:flex-row sm:items-center sm:justify-between">
+                      <div>
+                        <div className="flex items-center gap-1.5 font-mono text-xs font-bold text-zinc-900">
+                          <Zap className="size-3.5 text-amber-500" />
+                          <span>1-Click Auto-Settle via Real-Time Spot Price</span>
+                        </div>
+                        <p className="mt-0.5 text-[11px] text-zinc-500">
+                          Pulls verified spot settlement from Binance/Coinbase, compares against strike, and trains AI automatically.
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={autoSettleTrade}
+                        disabled={autoSettling || submittingFeedback}
+                        className="inline-flex items-center justify-center gap-1.5 rounded-lg bg-zinc-900 px-3.5 py-2 text-xs font-semibold text-white shadow hover:bg-zinc-800 disabled:opacity-50 transition cursor-pointer"
+                      >
+                        {autoSettling ? (
+                          <>
+                            <Loader2 className="size-3.5 animate-spin" />
+                            <span>Resolving Spot...</span>
+                          </>
+                        ) : (
+                          <>
+                            <Sparkles className="size-3.5 text-amber-400" />
+                            <span>Auto-Detect &amp; Learn</span>
+                          </>
+                        )}
+                      </button>
+                    </div>
+                  )}
 
                   {feedbackResult ? (
                     <div className="space-y-3 rounded-lg border border-accent/20 bg-accent/[0.04] p-4">
@@ -1056,25 +1179,25 @@ export default function PredictionMarketHome() {
                         <div className="flex gap-2">
                           <button
                             type="button"
-                            onClick={() => setFeedbackOutcome("YES")}
+                            onClick={() => setFeedbackOutcome(affirmativeLabel)}
                             className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
-                              feedbackOutcome === "YES"
+                              feedbackOutcome === affirmativeLabel || (affirmativeLabel === "UP" && feedbackOutcome === "YES")
                                 ? "bg-emerald-600 text-white shadow-md shadow-emerald-600/20"
                                 : "border border-line bg-surface text-zinc-500 hover:text-zinc-900"
                             }`}
                           >
-                            Resolved YES
+                            Resolved {affirmativeLabel}
                           </button>
                           <button
                             type="button"
-                            onClick={() => setFeedbackOutcome("NO")}
+                            onClick={() => setFeedbackOutcome(negativeLabel)}
                             className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
-                              feedbackOutcome === "NO"
+                              feedbackOutcome === negativeLabel || (negativeLabel === "DOWN" && feedbackOutcome === "NO")
                                 ? "bg-rose-600 text-white shadow-md shadow-rose-600/20"
                                 : "border border-line bg-surface text-zinc-500 hover:text-zinc-900"
                             }`}
                           >
-                            Resolved NO
+                            Resolved {negativeLabel}
                           </button>
                         </div>
                       </div>
