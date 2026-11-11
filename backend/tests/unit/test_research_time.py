@@ -36,22 +36,25 @@ def _version(
     published_at: datetime | None = None,
     source_updated_at: datetime | None = None,
     version_is_valid: bool = True,
-    availability_source: str = "capture",
+    availability_source: str = "runtime_capture",
 ) -> DocumentVersion:
     return DocumentVersion(
         version_id=uuid4(),
         document_id=_DOC_ID,
         source_id="test-source",
+        canonical_url="https://example.com/article",
+        final_url="https://example.com/article",
+        title="Test Article",
         content_hash="sha256:" + "a" * 64,
         capture_method="approved_publisher_page",
         extraction_version="html-extractor-1.0",
+        first_seen_at=captured_at,
         captured_at=captured_at,
         available_at=available_at,
         availability_source=availability_source,
         published_at=published_at,
         source_updated_at=source_updated_at,
         version_is_valid=version_is_valid,
-        created_at=captured_at,
     )
 
 

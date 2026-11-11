@@ -14,7 +14,7 @@ import re
 from collections.abc import Callable
 from datetime import datetime
 from typing import Any
-from uuid import UUID, uuid5
+from uuid import UUID, uuid4, uuid5
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -486,6 +486,52 @@ class RuleBasedClaimExtractor:
             if matched_in_span:
                 passages += 1
         return claims[: self._max_claims]
+
+
+class ClaimExtractor:
+    """Ergonomic facade over :class:`RuleBasedClaimExtractor`.
+
+    The facade does not relax provenance: if a plan or registry is omitted it is
+    derived deterministically from the target and the default source registry.
+    Every emitted claim still carries a document version, source, span, and
+    quote hash.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_passages_per_document: int = 3,
+        max_claims: int = 50,
+    ) -> None:
+        self._extractor = RuleBasedClaimExtractor(
+            max_passages_per_document=max_passages_per_document,
+            max_claims=max_claims,
+        )
+
+    def extract_from_document(
+        self,
+        document: ExtractedDocument,
+        *,
+        version: DocumentVersion,
+        target: ResearchTarget,
+        cutoff_at: datetime,
+        plan: ResearchPlan | None = None,
+        registry: SourceRegistry | None = None,
+        job_id: UUID | None = None,
+    ) -> list[Claim]:
+        from prediction_ai.research.planner import build_plan
+
+        resolved_registry = registry or SourceRegistry.default()
+        resolved_plan = plan or build_plan(target, registry=resolved_registry)
+        return self._extractor.extract(
+            job_id=job_id or uuid4(),
+            target=target,
+            version=version,
+            document=document,
+            plan=resolved_plan,
+            registry=resolved_registry,
+            cutoff_at=cutoff_at,
+        )
 
 
 class LLMClaimItem(BaseModel):

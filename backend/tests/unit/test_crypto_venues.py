@@ -224,3 +224,30 @@ async def test_fear_and_greed_uses_trailing_slash_endpoint() -> None:
     assert snapshot.classification == "Greed"
     assert requests[0].url.path == "/fng/"
     assert requests[0].url.params["limit"] == "1"
+
+
+@pytest.mark.asyncio
+async def test_fetch_futures_premium_computes_basis() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "premiumIndex" in request.url.path:
+            return httpx.Response(
+                200,
+                json={
+                    "symbol": "BTCUSDT",
+                    "markPrice": "68500.00",
+                    "indexPrice": "68400.00",
+                    "lastFundingRate": "0.00010000",
+                },
+            )
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        snapshot = await venues.fetch_futures_premium(client, "BTC")
+
+    assert snapshot is not None
+    assert snapshot.futures_price == 68500.00
+    assert snapshot.spot_price == 68400.00
+    # Basis: (68500 - 68400) / 68400 * 10000 = 100 / 68400 * 10000 ≈ 14.6198 bps
+    assert snapshot.premium_bps == pytest.approx(14.6198, abs=0.01)
+    assert snapshot.venue == "Binance Futures"
+

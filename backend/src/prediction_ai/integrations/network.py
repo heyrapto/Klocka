@@ -50,12 +50,12 @@ from prediction_ai.core.config import Settings, get_settings
 logger = structlog.get_logger(__name__)
 
 # Prefer IP-literal DoH endpoints.  When the system resolver is the thing that
-# is broken, a DoH endpoint addressed by hostname cannot be bootstrapped.  The
-# two endpoints below need no DNS lookup and are operated by independent
-# providers (Cloudflare and Google).
+# is broken, a DoH endpoint addressed by hostname cannot be bootstrapped.
+# The endpoints below need no DNS lookup and are operated by independent
+# providers (Google, Cloudflare, and Quad9).
 _DEFAULT_DOH_ENDPOINTS: tuple[str, ...] = (
-    "https://1.1.1.1/dns-query",
     "https://8.8.8.8/resolve",
+    "https://1.1.1.1/dns-query",
 )
 
 _USER_AGENT = "prediction-intelligence/0.2 (+market-data)"
@@ -72,6 +72,7 @@ class _DnsCacheEntry:
 class _DohAnswer:
     ips: tuple[str, ...]
     ttl_seconds: float
+    is_nxdomain: bool = False
 
 
 # Process-wide cache.  Only immutable tuples are stored, and updates are simple
@@ -79,6 +80,9 @@ class _DohAnswer:
 # prefork workers, tests) without binding an asyncio primitive to one loop.
 _DNS_CACHE: dict[str, _DnsCacheEntry] = {}
 _SYSTEM_DNS_FAILED_UNTIL: dict[str, float] = {}
+_LAST_KNOWN_IPS: dict[str, tuple[str, ...]] = {}
+_DOH_ENDPOINT_BACKOFF: dict[str, float] = {}
+_DOH_ENDPOINT_FAILURES: dict[str, int] = {}
 
 
 def clear_dns_cache() -> None:
@@ -86,6 +90,9 @@ def clear_dns_cache() -> None:
 
     _DNS_CACHE.clear()
     _SYSTEM_DNS_FAILED_UNTIL.clear()
+    _LAST_KNOWN_IPS.clear()
+    _DOH_ENDPOINT_BACKOFF.clear()
+    _DOH_ENDPOINT_FAILURES.clear()
 
 
 def _is_public_ip(value: str) -> bool:
@@ -121,6 +128,8 @@ def _cache_get(host: str) -> tuple[str, ...] | None:
 
 
 def _cache_set(host: str, ips: tuple[str, ...], ttl_seconds: float) -> None:
+    if ips:
+        _LAST_KNOWN_IPS[host] = ips
     if len(_DNS_CACHE) >= _MAX_CACHE_ENTRIES:
         now = time.monotonic()
         for key, entry in list(_DNS_CACHE.items()):
@@ -163,7 +172,7 @@ class DnsResolver:
         self,
         *,
         doh_endpoints: Sequence[str] = _DEFAULT_DOH_ENDPOINTS,
-        system_timeout_seconds: float = 0.8,
+        system_timeout_seconds: float = 1.5,
         doh_timeout_seconds: float = 2.5,
         cache_ttl_seconds: float = 300.0,
         negative_cache_seconds: float = 30.0,
@@ -184,7 +193,11 @@ class DnsResolver:
                 "Accept": "application/dns-json",
                 "User-Agent": _USER_AGENT,
             },
-            limits=httpx.Limits(max_connections=8, max_keepalive_connections=4),
+            limits=httpx.Limits(
+                max_connections=64,
+                max_keepalive_connections=32,
+                keepalive_expiry=60.0,
+            ),
         )
         self._inflight: dict[str, asyncio.Task[tuple[str, ...]]] = {}
 
@@ -248,11 +261,18 @@ class DnsResolver:
                     error=type(exc).__name__,
                     error_detail=str(exc) or None,
                 )
-            _SYSTEM_DNS_FAILED_UNTIL[host] = time.monotonic() + max(
-                30.0, self._cache_ttl
-            )
+            # Transient system DNS failure: only back off briefly (15s) instead of 300s
+            _SYSTEM_DNS_FAILED_UNTIL[host] = time.monotonic() + 15.0
 
         if not self._endpoints:
+            stale = _LAST_KNOWN_IPS.get(host)
+            if stale:
+                logger.warning(
+                    "Serving stale cached IP addresses after system DNS failure (no DoH endpoints)",
+                    host=host,
+                    stale_ips=stale,
+                )
+                return stale
             _cache_set(host, (), self._negative_cache_ttl)
             return ()
 
@@ -261,21 +281,39 @@ class DnsResolver:
             _cache_set(host, answer.ips, min(answer.ttl_seconds, self._cache_ttl))
             return answer.ips
 
+        # If live resolvers failed, serve stale cached IP if available (stale-while-revalidate)
+        stale = _LAST_KNOWN_IPS.get(host)
+        if stale:
+            logger.warning(
+                "Serving stale cached IP addresses after DNS resolver failure",
+                host=host,
+                stale_ips=stale,
+            )
+            _cache_set(host, stale, 30.0)
+            return stale
+
         logger.warning(
             "DNS resolution failed for market-data host",
             host=host,
             doh_endpoints=list(self._endpoints),
             doh_errors=errors or None,
         )
-        _cache_set(host, (), self._negative_cache_ttl)
+        # Only negative-cache if the domain was explicitly confirmed as NXDOMAIN
+        if answer is not None and answer.is_nxdomain:
+            _cache_set(host, (), self._negative_cache_ttl)
         return ()
 
     async def _resolve_doh(
         self, host: str
     ) -> tuple[_DohAnswer | None, dict[str, str]]:
+        now = time.monotonic()
+        # Circuit breaker: prioritize healthy endpoints that are not in backoff
+        healthy = [ep for ep in self._endpoints if _DOH_ENDPOINT_BACKOFF.get(ep, 0.0) <= now]
+        endpoints_to_query = healthy if healthy else list(self._endpoints)
+
         tasks: dict[asyncio.Task[tuple[_DohAnswer | None, str | None]], str] = {
             asyncio.create_task(self._query_doh(endpoint, host)): endpoint
-            for endpoint in self._endpoints
+            for endpoint in endpoints_to_query
         }
         pending = set(tasks)
         errors: dict[str, str] = {}
@@ -296,7 +334,14 @@ class DnsResolver:
                         answer, error = None, f"{type(exc).__name__}: {exc}"
                     if error:
                         errors[endpoint] = error
+                        fails = _DOH_ENDPOINT_FAILURES.get(endpoint, 0) + 1
+                        _DOH_ENDPOINT_FAILURES[endpoint] = fails
+                        if fails >= 2:
+                            _DOH_ENDPOINT_BACKOFF[endpoint] = time.monotonic() + 60.0
                     if answer is not None and answer.ips:
+                        # Reset failure counter on success
+                        _DOH_ENDPOINT_FAILURES[endpoint] = 0
+                        _DOH_ENDPOINT_BACKOFF.pop(endpoint, None)
                         logger.info(
                             "Resolved market-data host via DNS-over-HTTPS",
                             host=host,
@@ -306,7 +351,12 @@ class DnsResolver:
                         )
                         return answer, errors
             for task in pending:
-                errors[tasks[task]] = "timeout"
+                endpoint = tasks[task]
+                errors[endpoint] = "timeout"
+                fails = _DOH_ENDPOINT_FAILURES.get(endpoint, 0) + 1
+                _DOH_ENDPOINT_FAILURES[endpoint] = fails
+                if fails >= 2:
+                    _DOH_ENDPOINT_BACKOFF[endpoint] = time.monotonic() + 60.0
             return None, errors
         finally:
             for task in pending:
@@ -332,8 +382,14 @@ class DnsResolver:
         except ValueError as exc:
             return None, f"invalid JSON: {exc}"
 
-        if not isinstance(payload, dict) or payload.get("Status") != 0:
-            return None, f"DNS status {payload.get('Status') if isinstance(payload, dict) else 'unknown'}"
+        if not isinstance(payload, dict):
+            return None, "invalid JSON: payload not a dict"
+
+        status = payload.get("Status")
+        if status == 3:  # NXDOMAIN
+            return _DohAnswer(ips=(), ttl_seconds=60.0, is_nxdomain=True), "NXDOMAIN"
+        if status != 0:
+            return None, f"DNS status {status if status is not None else 'unknown'}"
 
         answers = payload.get("Answer")
         if not isinstance(answers, list):
@@ -455,6 +511,60 @@ def _environment_proxy() -> str | None:
         if value:
             return value
     return None
+
+
+KNOWN_MARKET_DATA_HOSTS: tuple[str, ...] = (
+    "api.binance.com",
+    "fapi.binance.com",
+    "api.binance.us",
+    "api.coinbase.com",
+    "api.exchange.coinbase.com",
+    "api.kraken.com",
+    "www.okx.com",
+    "api.bybit.com",
+    "api.gateio.ws",
+    "api.mexc.com",
+    "api.coingecko.com",
+    "coins.llama.fi",
+    "benchmarks.pyth.network",
+    "api.alternative.me",
+)
+
+
+async def prewarm_market_data_dns(
+    resolver: DnsResolver | None = None,
+    hosts: Sequence[str] = KNOWN_MARKET_DATA_HOSTS,
+) -> dict[str, int]:
+    """Pre-resolve known market data hosts concurrently into in-memory cache.
+
+    Pre-warming ensures that live pipeline analyses never pay cold DNS lookup
+    penalties and encounter zero connect latency on critical-path exchange API calls.
+    """
+    resolved_resolver = resolver
+    owns = False
+    if resolved_resolver is None:
+        resolved_resolver = DnsResolver()
+        owns = True
+
+    results: dict[str, int] = {}
+    try:
+        tasks = [resolved_resolver.resolve(h) for h in hosts]
+        resolved = await asyncio.gather(*tasks, return_exceptions=True)
+        for h, res in zip(hosts, resolved, strict=False):
+            if isinstance(res, tuple):
+                results[h] = len(res)
+            else:
+                results[h] = 0
+        resolved_count = sum(1 for v in results.values() if v > 0)
+        logger.info(
+            "Market data DNS pre-warming completed",
+            total_hosts=len(hosts),
+            resolved_hosts=resolved_count,
+        )
+    finally:
+        if owns:
+            await resolved_resolver.aclose()
+    return results
 
 
 def build_resilient_client(

@@ -1,6 +1,6 @@
 "use client";
 
-import { Clock, Hourglass, Zap } from "lucide-react";
+import { Hourglass, Zap } from "lucide-react";
 import { useEffect, useState } from "react";
 
 interface IntervalTimerProps {
@@ -32,22 +32,35 @@ export function IntervalTimer({
 }: IntervalTimerProps) {
   const [secondsRemaining, setSecondsRemaining] = useState<number | null>(() => {
     if (!resolvesAt) return decisionSecondsRemaining ?? null;
-    const diff = Math.floor((new Date(resolvesAt).getTime() - Date.now()) / 1000);
+    const diff = Math.ceil((new Date(resolvesAt).getTime() - Date.now()) / 1000);
     return Math.max(0, diff);
   });
 
   useEffect(() => {
-    if (!resolvesAt) return;
+    if (resolvesAt) {
+      function update() {
+        const diff = Math.ceil((new Date(resolvesAt!).getTime() - Date.now()) / 1000);
+        setSecondsRemaining(Math.max(0, diff));
+      }
 
-    function update() {
-      const diff = Math.floor((new Date(resolvesAt!).getTime() - Date.now()) / 1000);
-      setSecondsRemaining(Math.max(0, diff));
+      update();
+      const interval = setInterval(update, 1000);
+      return () => clearInterval(interval);
     }
 
-    update();
-    const interval = setInterval(update, 1000);
-    return () => clearInterval(interval);
-  }, [resolvesAt]);
+    if (decisionSecondsRemaining != null) {
+      const startedAt = Date.now();
+      const initial = decisionSecondsRemaining;
+      function update() {
+        const elapsed = Math.floor((Date.now() - startedAt) / 1000);
+        setSecondsRemaining(Math.max(0, initial - elapsed));
+      }
+
+      update();
+      const interval = setInterval(update, 1000);
+      return () => clearInterval(interval);
+    }
+  }, [resolvesAt, decisionSecondsRemaining]);
 
   if (secondsRemaining === null) return null;
 
@@ -105,7 +118,7 @@ export function IntervalTimer({
           </div>
           {resolvesAt && (
             <p className="mt-0.5 text-[11px] font-mono text-zinc-500">
-              Contract resolves at {new Date(resolvesAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })} UTC
+              Contract resolves at {new Date(resolvesAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", timeZone: "UTC" })} UTC
             </p>
           )}
         </div>

@@ -21,6 +21,9 @@ import {
 } from "lucide-react";
 import { CalibrationCard } from "@/components/analyses/calibration-card";
 import { IntervalTimer } from "@/components/analyses/interval-timer";
+import { usePredictionSuccess } from "@/components/ui/prediction-success-context";
+import type { CelebratePayload } from "@/components/ui/prediction-success-context";
+import type { Forecast } from "@/lib/types";
 
 interface DecisionMetrics {
   executable_ask_yes?: number | null;
@@ -196,6 +199,82 @@ const TOTAL_PIPELINE_STAGES = STAGE_ORDER.length;
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
+/**
+ * Adapts the page's snake_case ForecastDetail into the camelCase Forecast
+ * shape consumed by PredictionSuccessModal. Only the fields rendered by the
+ * modal are mapped; the rest fall back to safe sentinel values so the modal
+ * always has something to display.
+ */
+function buildCelebratePayload(
+  fd: NonNullable<AnalysisDetail["forecast"]>,
+): CelebratePayload {
+  const celebrateForecast: Forecast = {
+    id: fd.id,
+    analysisId: "",
+    marketId: fd.market?.id ?? "",
+    forecastedAt: new Date().toISOString(),
+    targetDefinition: fd.market?.title ?? "",
+    probabilityYes: Number(fd.probability_yes),
+    probabilityNo: Number(fd.probability_no),
+    uncertaintyInterval: [
+      Number(fd.uncertainty_interval?.[0] ?? 0),
+      Number(fd.uncertainty_interval?.[1] ?? 1),
+    ],
+    recommendation: fd.recommendation,
+    decisionMetrics: {
+      executableAskYes: fd.decision_metrics?.executable_ask_yes ?? 0,
+      executableAskNo: fd.decision_metrics?.executable_ask_no ?? 0,
+      effectiveCostYes: fd.decision_metrics?.effective_cost_yes ?? 0,
+      effectiveCostNo: fd.decision_metrics?.effective_cost_no ?? 0,
+      estimatedNetEdgeYes: fd.decision_metrics?.estimated_net_edge_yes ?? 0,
+      estimatedNetEdgeNo: fd.decision_metrics?.estimated_net_edge_no ?? 0,
+      minimumRequiredEdge: fd.decision_metrics?.minimum_required_edge ?? 0,
+      spread: fd.decision_metrics?.spread ?? 0,
+      slippageBps: fd.decision_metrics?.slippage_bps ?? 0,
+      quarterKellyFraction: fd.decision_metrics?.quarter_kelly_fraction ?? 0,
+      takerFeeRate: (fd.decision_metrics as Record<string, number> | null)?.taker_fee_rate ?? 0,
+    },
+    dataQuality: {
+      marketVerified: false,
+      criticalFeedsFresh: false,
+      researchSufficient: false,
+      missingFeatures: [],
+      warnings: [],
+      feeds: [],
+    },
+    modelVersion: "",
+    calibrationVersion: "",
+    promptVersion: "",
+    decisionPolicyVersion: "",
+    inputSnapshot: {
+      snapshotId: "",
+      marketDataSnapshotId: "",
+      featureSetVersion: "",
+      screenshotSha256: "",
+      evidencePackId: "",
+    },
+    explanation: {
+      summary: fd.explanation?.decision_reason ?? fd.explanation?.reasoning ?? "",
+      supportingSignals: fd.explanation?.key_drivers ?? [],
+      contradictingSignals: [],
+      risks: [],
+      invalidationConditions: [],
+    },
+    evidence: [],
+    // The feedback API confirms was_correct === true, so the outcome matches
+    // the recommendation direction.
+    resolvedOutcome:
+      fd.recommendation === "BUY_YES"
+        ? "YES"
+        : fd.recommendation === "BUY_NO"
+          ? "NO"
+          : "YES",
+    brierContribution: null,
+  };
+
+  return { forecast: celebrateForecast };
+}
+
 export default function PredictionMarketHome() {
   const [file, setFile] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
@@ -218,6 +297,8 @@ export default function PredictionMarketHome() {
   const [settlementFile, setSettlementFile] = useState<File | null>(null);
   const [settlementPreview, setSettlementPreview] = useState<string | null>(null);
   const settlementInputRef = useRef<HTMLInputElement>(null);
+
+  const { celebrate } = usePredictionSuccess();
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
@@ -488,9 +569,15 @@ export default function PredictionMarketHome() {
         const errJson = await res.json().catch(() => ({}));
         throw new Error(errJson.detail || "Failed to submit post-settlement feedback");
       }
-      const data = await res.json();
+      const data: FeedbackResult = await res.json();
       setFeedbackResult(data);
       setCalibrationCounter((c) => c + 1);
+      if (data.was_correct) {
+        const fd = analysisDetail?.forecast;
+        if (fd) {
+          celebrate(buildCelebratePayload(fd));
+        }
+      }
     } catch (err: unknown) {
       setFeedbackError(err instanceof Error ? err.message : "Error submitting feedback");
     } finally {
@@ -510,9 +597,15 @@ export default function PredictionMarketHome() {
         const errJson = await res.json().catch(() => ({}));
         throw new Error(errJson.detail || "Auto-settlement failed. You can still report settlement manually below.");
       }
-      const data = await res.json();
+      const data: FeedbackResult = await res.json();
       setFeedbackResult(data);
       setCalibrationCounter((c) => c + 1);
+      if (data.was_correct) {
+        const fd = analysisDetail?.forecast;
+        if (fd) {
+          celebrate(buildCelebratePayload(fd));
+        }
+      }
     } catch (err: unknown) {
       setFeedbackError(err instanceof Error ? err.message : "Error auto-settling trade");
     } finally {
@@ -834,9 +927,9 @@ export default function PredictionMarketHome() {
             {forecast && (
               <div className="space-y-6 rounded-2xl border border-line bg-surface p-6 shadow-[0_18px_48px_-24px_rgba(23,23,23,0.16)] sm:p-8">
                 {/* Live Interval Countdown & Timing Provenance */}
-                {(forecast.market?.resolves_at || forecast.timing_provenance) && (
+                {(forecast.timing_provenance || forecast.market?.resolves_at) && (
                   <IntervalTimer
-                    resolvesAt={forecast.market?.resolves_at || forecast.timing_provenance?.exact_resolves_at}
+                    resolvesAt={forecast.timing_provenance?.exact_resolves_at || forecast.market?.resolves_at}
                     pipelineLatencySeconds={forecast.timing_provenance?.pipeline_latency_seconds}
                     initialSecondsRemaining={forecast.timing_provenance?.initial_seconds_remaining}
                     decisionSecondsRemaining={forecast.timing_provenance?.decision_seconds_remaining}
@@ -1097,7 +1190,7 @@ export default function PredictionMarketHome() {
                           <span>1-Click Auto-Settle via Real-Time Spot Price</span>
                         </div>
                         <p className="mt-0.5 text-[11px] text-zinc-500">
-                          Pulls verified spot settlement from Binance/Coinbase, compares against strike, and trains AI automatically.
+                          Pulls verified spot settlement from a global exchange mesh, compares against strike, and trains AI automatically.
                         </p>
                       </div>
                       <button
@@ -1125,7 +1218,14 @@ export default function PredictionMarketHome() {
                     <div className="space-y-3 rounded-lg border border-accent/20 bg-accent/[0.04] p-4">
                       <div className="flex items-center justify-between">
                         <div className="flex items-center gap-2">
-                          {feedbackResult.was_correct ? (
+                          {forecast?.recommendation === "NO_TRADE" ? (
+                            // Abstention outcome — never show green (AGENTS.md rule 6)
+                            <span className="rounded border border-indigo-200 bg-indigo-50 px-2.5 py-0.5 text-xs font-semibold text-indigo-700">
+                              {feedbackResult.was_correct
+                                ? "Abstention Audited (Lean Aligned)"
+                                : "Disciplined Abstention (Capital Preserved)"}
+                            </span>
+                          ) : feedbackResult.was_correct ? (
                             <span className="rounded border border-emerald-200 bg-emerald-50 px-2.5 py-0.5 text-xs font-semibold text-emerald-700">
                               Prediction Correct (Aligned)
                             </span>

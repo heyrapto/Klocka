@@ -129,10 +129,10 @@ class Settings(BaseSettings):
     # is the component that has failed.  Hostname endpoints may be added when a
     # deployment requires them (and can already resolve their own hostnames).
     MARKET_DATA_DOH_ENDPOINTS: str = (
-        "https://1.1.1.1/dns-query,"
-        "https://8.8.8.8/resolve"
+        "https://8.8.8.8/resolve,"
+        "https://1.1.1.1/dns-query"
     )
-    MARKET_DATA_DNS_SYSTEM_TIMEOUT_SECONDS: float = Field(default=0.8, gt=0.0, le=10.0)
+    MARKET_DATA_DNS_SYSTEM_TIMEOUT_SECONDS: float = Field(default=1.5, gt=0.0, le=10.0)
     MARKET_DATA_DNS_DOH_TIMEOUT_SECONDS: float = Field(default=2.5, gt=0.0, le=10.0)
     MARKET_DATA_DNS_CACHE_TTL_SECONDS: int = Field(default=300, ge=30, le=3600)
     MARKET_DATA_DNS_NEGATIVE_CACHE_SECONDS: int = Field(default=30, ge=5, le=300)
@@ -180,7 +180,10 @@ class Settings(BaseSettings):
     DECISION_UNCERTAINTY_MARGIN: float = Field(default=0.02, ge=0.0, le=1.0)
     DECISION_SLIPPAGE_BPS: int = Field(default=15, ge=0, le=1000)
     DECISION_KELLY_FRACTION: float = Field(default=0.25, gt=0.0, le=1.0)
-    DECISION_MAX_QUOTE_AGE_SECONDS: float = Field(default=15.0, gt=0.0)
+    # 60 s gives enough headroom for the full multi-venue API call chain
+    # (spot fetch → order book → decision) without triggering STALE_QUOTE
+    # abstention on every real-world analysis.
+    DECISION_MAX_QUOTE_AGE_SECONDS: float = Field(default=60.0, gt=0.0)
     DECISION_POLICY_VERSION: str = "decision_policy_v1"
 
     # ------------------------------------------------------------------

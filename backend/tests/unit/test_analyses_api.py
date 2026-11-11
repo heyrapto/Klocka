@@ -157,6 +157,18 @@ async def test_sse_stream_includes_stage_in_payload():
 
 @pytest.mark.asyncio
 async def test_feedback_abstention_is_not_scored_as_correct():
+    """Abstentions are now fully analyzed by the postmortem engine.
+
+    When a NO_TRADE recommendation is settled, the postmortem:
+    - runs real causal analysis (not a canned fallback)
+    - sets evaluation_eligible=True so calibration can be updated
+    - classifies the lean (ABSTENTION_ALIGNED_LEAN / ABSTENTION_SAVED_CAPITAL)
+    - was_correct reflects whether the probability lean matched the outcome
+
+    For this test: recommendation=NO_TRADE, probability_yes=0.52, outcome=NO.
+    P(YES)=0.52 → lean was YES; actual=NO → lean was WRONG → was_correct=False.
+    But the abstention still runs the postmortem and is evaluation_eligible.
+    """
     from prediction_ai.db.sqlite import get_sqlite_db
 
     sqlite = get_sqlite_db()
@@ -175,7 +187,6 @@ async def test_feedback_abstention_is_not_scored_as_correct():
             "explanation": {"reasoning": "Edge did not clear costs."},
         },
     })
-    before = await sqlite.get_asset_calibration("XRP", "crypto")
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -186,12 +197,17 @@ async def test_feedback_abstention_is_not_scored_as_correct():
 
     assert response.status_code == 200
     body = response.json()
+    # Lean was YES (0.52) but outcome was NO → lean was wrong
     assert body["was_correct"] is False
-    assert body["evaluation_eligible"] is False
-    assert body["discrepancy_classification"] == "ABSTENTION_NO_TRADE"
-
-    after = await sqlite.get_asset_calibration("XRP", "crypto")
-    assert after["sample_count"] == before["sample_count"]
+    # Abstentions now run a full postmortem and feed calibration
+    assert body["evaluation_eligible"] is True
+    # Classification must be one of the abstention types
+    assert body["discrepancy_classification"] in {
+        "ABSTENTION_ALIGNED_LEAN",
+        "ABSTENTION_SAVED_CAPITAL",
+        "ABSTENTION_VOLATILITY_EXPANSION",
+        "ABSTENTION_REGIME_UNCERTAINTY",
+    }
 
 
 @pytest.mark.asyncio

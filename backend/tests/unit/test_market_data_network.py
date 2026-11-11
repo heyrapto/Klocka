@@ -138,3 +138,52 @@ async def test_transport_fails_closed_when_no_public_address_is_available() -> N
     async with httpx.AsyncClient(transport=transport) as client:
         with pytest.raises(httpx.ConnectError, match="DNS resolution failed"):
             await client.get("https://api.binance.test/api/v3/ticker/price")
+
+
+@pytest.mark.asyncio
+async def test_resolver_serves_stale_cache_on_failure() -> None:
+    import asyncio
+
+    # Prime cache first with a valid answer
+    network._cache_set("api.bybit.test", ("104.18.25.10",), ttl_seconds=0.01)
+    await asyncio.sleep(0.02)
+
+    async def failing_system(host: str) -> list[str]:
+        raise OSError("network down")
+
+    resolver = network.DnsResolver(
+        system_resolver=failing_system,
+        doh_endpoints=(),
+        system_timeout_seconds=0.1,
+    )
+    try:
+        ips = await resolver.resolve("api.bybit.test")
+    finally:
+        await resolver.aclose()
+
+    # Must gracefully fall back to stale cached IP instead of failing closed
+    assert ips == ("104.18.25.10",)
+
+
+@pytest.mark.asyncio
+async def test_prewarm_market_data_dns() -> None:
+    async def mock_system(host: str) -> list[str]:
+        return ["93.184.216.34"]
+
+    resolver = network.DnsResolver(
+        system_resolver=mock_system,
+        doh_endpoints=(),
+        system_timeout_seconds=0.5,
+    )
+    try:
+        results = await network.prewarm_market_data_dns(
+            resolver=resolver,
+            hosts=["api.binance.com", "api.kraken.com"],
+        )
+    finally:
+        await resolver.aclose()
+
+    assert results["api.binance.com"] == 1
+    assert results["api.kraken.com"] == 1
+    assert network._cache_get("api.binance.com") == ("93.184.216.34",)
+

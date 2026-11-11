@@ -43,6 +43,8 @@ def _entry(
         claim_categories=claim_categories or [],
         enabled=enabled,
         authority_tier=authority_tier,
+        terms_reviewed_at=_NOW,
+        robots_reviewed_at=_NOW,
         created_at=_NOW,
         updated_at=_NOW,
     )

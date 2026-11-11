@@ -3,30 +3,30 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from uuid import uuid4
+from typing import Any
+from uuid import UUID, uuid4
 
 import pytest
 
-from prediction_ai.research.enums import (
-    ClaimCategory,
-    ClaimModality,
-    ClaimStance,
-    EpistemicState,
-)
 from prediction_ai.research.claims import (
     ClaimExtractor,
-    LLMClaimCandidate,
+    ClaimValidationError,
+    LLMClaimItem,
+    LLMClaimOutput,
     validate_llm_claims,
 )
 from prediction_ai.research.enums import (
     AccessMethod,
+    ClaimCategory,
+    ClaimModality,
+    ClaimStance,
     CommercialUseStatus,
-    EligibilityState,
+    EpistemicState,
     SourceType,
-    SupportState,
     TargetVerificationStatus,
     ValidationState,
 )
+from prediction_ai.research.extract import quote_hash
 from prediction_ai.research.models import (
     DocumentVersion,
     ExtractedDocument,
@@ -45,15 +45,18 @@ def _doc_version() -> DocumentVersion:
         version_id=uuid4(),
         document_id=uuid4(),
         source_id="test-source",
+        canonical_url="https://example.com/article",
+        final_url="https://example.com/article",
+        title="Test Article",
         content_hash="sha256:" + "a" * 64,
         capture_method="approved_publisher_page",
         extraction_version="html-extractor-1.0",
+        first_seen_at=_BEFORE,
         captured_at=_BEFORE,
         available_at=_BEFORE,
-        availability_source="capture",
+        availability_source="runtime_capture",
         published_at=_BEFORE,
         version_is_valid=True,
-        created_at=_BEFORE,
     )
 
 
@@ -106,6 +109,8 @@ def _source_entry() -> SourceRegistryEntry:
         access_method=AccessMethod.OFFICIAL_API,
         commercial_use_status=CommercialUseStatus.APPROVED,
         enabled=True,
+        terms_reviewed_at=_NOW,
+        robots_reviewed_at=_NOW,
         created_at=_NOW,
         updated_at=_NOW,
     )
@@ -169,83 +174,133 @@ class TestDeterministicExtractor:
 
 
 class TestLLMClaimValidation:
-    """LLM claim output must be rejected unless it validates against known source IDs and spans."""
+    """LLM output must validate against the captured source, version, span, and quote."""
 
-    def _known_ids(self) -> tuple[set[str], set[str]]:
-        source_id = "test-source"
-        version_id = str(uuid4())
-        return {source_id}, {version_id}
+    def _context(
+        self,
+    ) -> tuple[DocumentVersion, dict[UUID, DocumentVersion], dict[UUID, set[str]]]:
+        version = _doc_version()
+        return (
+            version,
+            {version.version_id: version},
+            {version.version_id: {"paragraph:0"}},
+        )
+
+    def _item(self, version: DocumentVersion, **overrides: Any) -> LLMClaimItem:
+        excerpt = str(overrides.pop("excerpt", "The manager officially departed."))
+        base: dict[str, Any] = {
+            "claim_text": excerpt,
+            "claim_category": ClaimCategory.MANAGER_DEPARTURE,
+            "predicate": "announced_departure",
+            "stance_on_proposition": ClaimStance.SUPPORTS_YES,
+            "claim_modality": ClaimModality.OFFICIAL_STATEMENT,
+            "epistemic_state": EpistemicState.ASSERTED,
+            "source_id": version.source_id,
+            "document_version_id": version.version_id,
+            "span_locator": "paragraph:0",
+            "quote_hash": quote_hash(excerpt),
+            "excerpt": excerpt,
+        }
+        base.update(overrides)
+        return LLMClaimItem(**base)
+
+    def _validate(
+        self,
+        items: list[LLMClaimItem],
+        context: tuple[DocumentVersion, dict[UUID, DocumentVersion], dict[UUID, set[str]]],
+    ) -> list:
+        _, versions_by_id, spans_by_version = context
+        return validate_llm_claims(
+            LLMClaimOutput(claims=items),
+            job_id=uuid4(),
+            target=_target(),
+            versions_by_id=versions_by_id,
+            spans_by_version=spans_by_version,
+            cutoff_at=_NOW,
+            extraction_model_version="test-extractor-v1",
+            extraction_prompt_version="test-prompt-v1",
+        )
 
     def test_valid_candidate_accepted(self) -> None:
-        source_ids, version_ids = self._known_ids()
-        version_id = next(iter(version_ids))
-        source_id = next(iter(source_ids))
-
-        candidate = LLMClaimCandidate(
-            claim_text="The manager officially departed.",
-            claim_category=ClaimCategory.MANAGER_DEPARTURE,
-            stance_on_proposition=ClaimStance.SUPPORTS_YES,
-            claim_modality=ClaimModality.OFFICIAL_STATEMENT,
-            epistemic_state=EpistemicState.ASSERTED,
-            source_id=source_id,
-            document_version_id=version_id,
-            evidence_span_locator="paragraph:1",
-            evidence_span_quote_hash="sha256:" + "c" * 64,
+        version, versions_by_id, spans_by_version = self._context()
+        results = validate_llm_claims(
+            LLMClaimOutput(claims=[self._item(version)]),
+            job_id=uuid4(),
+            target=_target(),
+            versions_by_id=versions_by_id,
+            spans_by_version=spans_by_version,
+            cutoff_at=_NOW,
+            extraction_model_version="test-extractor-v1",
+            extraction_prompt_version="test-prompt-v1",
         )
-        results = validate_llm_claims([candidate], known_source_ids=source_ids, known_version_ids=version_ids)
         assert len(results) == 1
+        assert results[0].source_id == version.source_id
+        assert results[0].document_version_id == version.version_id
+        assert results[0].evidence_span.locator == "paragraph:0"
+        assert results[0].validation_state is ValidationState.PENDING_REVIEW
 
     def test_missing_source_id_rejected(self) -> None:
-        source_ids, version_ids = self._known_ids()
-        version_id = next(iter(version_ids))
-
-        candidate = LLMClaimCandidate(
-            claim_text="The manager officially departed.",
-            claim_category=ClaimCategory.MANAGER_DEPARTURE,
-            stance_on_proposition=ClaimStance.SUPPORTS_YES,
-            claim_modality=ClaimModality.OFFICIAL_STATEMENT,
-            epistemic_state=EpistemicState.ASSERTED,
-            source_id="unknown-source",   # <- not in known_source_ids
-            document_version_id=version_id,
-            evidence_span_locator="paragraph:1",
-            evidence_span_quote_hash="sha256:" + "c" * 64,
-        )
-        results = validate_llm_claims([candidate], known_source_ids=source_ids, known_version_ids=version_ids)
-        assert len(results) == 0  # rejected
+        version, versions_by_id, spans_by_version = self._context()
+        with pytest.raises(ClaimValidationError, match="source_id"):
+            validate_llm_claims(
+                LLMClaimOutput(
+                    claims=[self._item(version, source_id="unknown-source")]
+                ),
+                job_id=uuid4(),
+                target=_target(),
+                versions_by_id=versions_by_id,
+                spans_by_version=spans_by_version,
+                cutoff_at=_NOW,
+                extraction_model_version="test-extractor-v1",
+                extraction_prompt_version="test-prompt-v1",
+            )
 
     def test_missing_evidence_span_rejected(self) -> None:
-        source_ids, version_ids = self._known_ids()
-        version_id = next(iter(version_ids))
-        source_id = next(iter(source_ids))
-
-        candidate = LLMClaimCandidate(
-            claim_text="The manager officially departed.",
-            claim_category=ClaimCategory.MANAGER_DEPARTURE,
-            stance_on_proposition=ClaimStance.SUPPORTS_YES,
-            claim_modality=ClaimModality.OFFICIAL_STATEMENT,
-            epistemic_state=EpistemicState.ASSERTED,
-            source_id=source_id,
-            document_version_id=version_id,
-            evidence_span_locator=None,   # <- missing span locator
-            evidence_span_quote_hash=None,
-        )
-        results = validate_llm_claims([candidate], known_source_ids=source_ids, known_version_ids=version_ids)
-        assert len(results) == 0
+        version, versions_by_id, spans_by_version = self._context()
+        with pytest.raises(ClaimValidationError, match="span locator"):
+            validate_llm_claims(
+                LLMClaimOutput(
+                    claims=[self._item(version, span_locator="paragraph:99")]
+                ),
+                job_id=uuid4(),
+                target=_target(),
+                versions_by_id=versions_by_id,
+                spans_by_version=spans_by_version,
+                cutoff_at=_NOW,
+                extraction_model_version="test-extractor-v1",
+                extraction_prompt_version="test-prompt-v1",
+            )
 
     def test_unknown_version_id_rejected(self) -> None:
-        source_ids, version_ids = self._known_ids()
-        source_id = next(iter(source_ids))
+        version, versions_by_id, spans_by_version = self._context()
+        with pytest.raises(ClaimValidationError, match="document version"):
+            validate_llm_claims(
+                LLMClaimOutput(
+                    claims=[self._item(version, document_version_id=uuid4())]
+                ),
+                job_id=uuid4(),
+                target=_target(),
+                versions_by_id=versions_by_id,
+                spans_by_version=spans_by_version,
+                cutoff_at=_NOW,
+                extraction_model_version="test-extractor-v1",
+                extraction_prompt_version="test-prompt-v1",
+            )
 
-        candidate = LLMClaimCandidate(
-            claim_text="The manager officially departed.",
-            claim_category=ClaimCategory.MANAGER_DEPARTURE,
-            stance_on_proposition=ClaimStance.SUPPORTS_YES,
-            claim_modality=ClaimModality.OFFICIAL_STATEMENT,
-            epistemic_state=EpistemicState.ASSERTED,
-            source_id=source_id,
-            document_version_id=str(uuid4()),  # <- not in known_version_ids
-            evidence_span_locator="paragraph:1",
-            evidence_span_quote_hash="sha256:" + "c" * 64,
-        )
-        results = validate_llm_claims([candidate], known_source_ids=source_ids, known_version_ids=version_ids)
-        assert len(results) == 0
+    def test_quote_hash_mismatch_rejected(self) -> None:
+        version, versions_by_id, spans_by_version = self._context()
+        with pytest.raises(ClaimValidationError, match="quote_hash"):
+            validate_llm_claims(
+                LLMClaimOutput(
+                    claims=[
+                        self._item(version, quote_hash="sha256:" + "c" * 64)
+                    ]
+                ),
+                job_id=uuid4(),
+                target=_target(),
+                versions_by_id=versions_by_id,
+                spans_by_version=spans_by_version,
+                cutoff_at=_NOW,
+                extraction_model_version="test-extractor-v1",
+                extraction_prompt_version="test-prompt-v1",
+            )

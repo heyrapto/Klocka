@@ -133,6 +133,14 @@ class DerivativesSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class FuturesPremiumSnapshot:
+    futures_price: float
+    spot_price: float
+    premium_bps: float  # (futures - spot) / spot * 10_000
+    venue: str
+
+
+@dataclass(frozen=True, slots=True)
 class FearGreedSnapshot:
     value: int
     classification: str
@@ -2071,6 +2079,30 @@ async def fetch_ohlcv_snapshot(
     return OhlcvSnapshot(candles=list(candles), venue=label, interval=interval)
 
 
+async def fetch_ohlcv_1m_snapshot(
+    client: httpx.AsyncClient,
+    symbol: str,
+    *,
+    budget_seconds: float = 10.0,
+    venues: Sequence[OhlcvVenue] = OHLCV_VENUES,
+) -> OhlcvSnapshot | None:
+    """Return the last 60 one-minute candles for the symbol.
+
+    Uses the same multi-venue race as :func:`fetch_ohlcv_snapshot`.
+    The tighter budget (10 s) is appropriate because 1-minute resolution
+    is a fresh-data signal; stale candles are discarded.
+    """
+    return await fetch_ohlcv_snapshot(
+        client,
+        symbol,
+        interval="1m",
+        limit=60,
+        min_candles=20,
+        budget_seconds=budget_seconds,
+        venues=venues,
+    )
+
+
 async def fetch_order_book_snapshot(
     client: httpx.AsyncClient,
     symbol: str,
@@ -2181,6 +2213,65 @@ async def fetch_derivatives_snapshot(
         open_interest_source=oi_source,
         open_interest_change_pct=oi_change,
         open_interest_change_source=change_source,
+    )
+
+
+async def fetch_futures_premium(
+    client: httpx.AsyncClient,
+    symbol: str,
+    *,
+    budget_seconds: float = 6.0,
+) -> FuturesPremiumSnapshot | None:
+    """Fetch the Binance perpetual futures mark price to compute premium vs spot.
+
+    Uses the ``premiumIndex`` endpoint which returns both ``markPrice`` and
+    ``indexPrice`` so the premium can be computed without a separate spot fetch.
+    Returns ``None`` when the symbol has no perpetual contract on Binance Futures.
+    """
+    pair = _binance_pair(symbol)
+    try:
+        raw = await asyncio.wait_for(
+            _request_json(
+                client,
+                f"{_BINANCE_FUTURES}/fapi/v1/premiumIndex",
+                params={"symbol": pair},
+                venue="Binance Futures",
+                data_type="futures_premium",
+            ),
+            timeout=budget_seconds,
+        )
+    except TimeoutError:
+        logger.warning(
+            "Futures premium fetch timed out",
+            symbol=symbol,
+            pair=pair,
+        )
+        return None
+
+    if not isinstance(raw, dict):
+        return None
+
+    futures_price = _to_float(raw.get("markPrice"))
+    index_price = _to_float(raw.get("indexPrice"))
+
+    if futures_price is None or futures_price <= 0:
+        return None
+    if index_price is None or index_price <= 0:
+        return None
+
+    premium_bps = (futures_price - index_price) / index_price * 10_000.0
+    logger.info(
+        "Futures premium fetched",
+        symbol=symbol,
+        futures_price=futures_price,
+        index_price=index_price,
+        premium_bps=round(premium_bps, 2),
+    )
+    return FuturesPremiumSnapshot(
+        futures_price=futures_price,
+        spot_price=index_price,
+        premium_bps=premium_bps,
+        venue="Binance Futures",
     )
 
 

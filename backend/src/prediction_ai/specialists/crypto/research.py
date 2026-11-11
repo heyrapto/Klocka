@@ -30,7 +30,7 @@ from __future__ import annotations
 import asyncio
 import re
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import structlog
@@ -46,10 +46,13 @@ from prediction_ai.specialists.crypto.venues import (
     BookSnapshot,
     DerivativesSnapshot,
     FearGreedSnapshot,
+    FuturesPremiumSnapshot,
     OhlcvSnapshot,
     SpotSnapshot,
     fetch_derivatives_snapshot,
     fetch_fear_and_greed,
+    fetch_futures_premium,
+    fetch_ohlcv_1m_snapshot,
     fetch_ohlcv_snapshot,
     fetch_order_book_snapshot,
     fetch_spot_snapshot,
@@ -153,28 +156,37 @@ def _parse_strike_and_direction(title: str) -> tuple[float | None, str]:
     return None, direction
 
 
-async def _load_vol_multiplier(symbol: str) -> float:
-    """Load the learned volatility calibration, defaulting to 1.0."""
+async def _load_calibration(symbol: str) -> dict[str, Any]:
+    """Load the learned asset calibration matrix from SQLite."""
     try:
         from prediction_ai.db.sqlite import get_sqlite_db  # noqa: PLC0415
 
         sqlite = get_sqlite_db()
         calibration = await sqlite.get_asset_calibration(symbol)
-        value = float(calibration.get("vol_multiplier", 1.0))
-        if 0.25 <= value <= 4.0:
-            return value
-        logger.warning(
-            "Ignoring out-of-range volatility calibration",
-            symbol=symbol,
-            vol_multiplier=value,
-        )
+        if calibration:
+            return calibration
     except Exception as exc:  # noqa: BLE001 - calibration is optional
         logger.warning(
-            "Could not load asset volatility calibration",
+            "Could not load asset calibration",
             symbol=symbol,
             error=type(exc).__name__,
             error_detail=str(exc) or None,
         )
+    return {
+        "symbol": symbol.upper(),
+        "vol_multiplier": 1.0,
+        "momentum_weight": 0.35,
+        "order_flow_weight": 0.30,
+        "uncertainty_margin": 0.02,
+    }
+
+
+async def _load_vol_multiplier(symbol: str) -> float:
+    """Load the learned volatility calibration, defaulting to 1.0."""
+    calibration = await _load_calibration(symbol)
+    value = float(calibration.get("vol_multiplier", 1.0))
+    if 0.25 <= value <= 4.0:
+        return value
     return 1.0
 
 
@@ -343,8 +355,12 @@ def _build_data_sources(
     book: BookSnapshot | None,
     derivatives: DerivativesSnapshot | None,
     fear_greed: FearGreedSnapshot | None,
+    ohlcv_1m: OhlcvSnapshot | None = None,
+    futures_premium: FuturesPremiumSnapshot | None = None,
 ) -> list[str]:
     sources = [spot_source, "Concurrent multi-venue mesh"]
+    if ohlcv_1m is not None:
+        sources.append(f"1m OHLCV: {ohlcv_1m.venue}")
     if ohlcv_15m is not None:
         sources.append(f"15m OHLCV: {ohlcv_15m.venue}")
     if ohlcv_1h is not None:
@@ -356,6 +372,8 @@ def _build_data_sources(
             sources.append(f"Funding: {derivatives.funding_source}")
         if derivatives.open_interest_source:
             sources.append(f"Open interest: {derivatives.open_interest_source}")
+    if futures_premium is not None:
+        sources.append(f"Futures premium: {futures_premium.venue}")
     if fear_greed is not None:
         sources.append(fear_greed.source)
     return _merge_flags(sources)
@@ -454,20 +472,37 @@ async def gather_crypto_intelligence(
             spot_snapshot,
             ohlcv_15m,
             ohlcv_1h,
+            ohlcv_1m_snap,
             book_snapshot,
             derivatives,
+            futures_premium_snap,
             fear_greed,
-        ) = await asyncio.gather(
-            fetch_spot_snapshot(client, symbol, budget_seconds=budget),
-            fetch_ohlcv_snapshot(client, symbol, "15m", 96, budget_seconds=budget),
-            fetch_ohlcv_snapshot(client, symbol, "1h", 48, budget_seconds=budget),
-            fetch_order_book_snapshot(client, symbol, 20, budget_seconds=budget),
-            fetch_derivatives_snapshot(client, symbol, budget_seconds=budget),
-            fetch_fear_and_greed(client),
+        ) = cast(
+            tuple[
+                SpotSnapshot | None,
+                OhlcvSnapshot | None,
+                OhlcvSnapshot | None,
+                OhlcvSnapshot | None,
+                BookSnapshot | None,
+                DerivativesSnapshot | None,
+                FuturesPremiumSnapshot | None,
+                FearGreedSnapshot | None,
+            ],
+            await asyncio.gather(
+                fetch_spot_snapshot(client, symbol, budget_seconds=budget),
+                fetch_ohlcv_snapshot(client, symbol, "15m", 96, budget_seconds=budget),
+                fetch_ohlcv_snapshot(client, symbol, "1h", 48, budget_seconds=budget),
+                fetch_ohlcv_1m_snapshot(client, symbol),
+                fetch_order_book_snapshot(client, symbol, 20, budget_seconds=budget),
+                fetch_derivatives_snapshot(client, symbol, budget_seconds=budget),
+                fetch_futures_premium(client, symbol),
+                fetch_fear_and_greed(client),
+            ),
         )
 
         candles_15m = list(ohlcv_15m.candles) if ohlcv_15m is not None else []
         candles_1h = list(ohlcv_1h.candles) if ohlcv_1h is not None else []
+        candles_1m = list(ohlcv_1m_snap.candles) if ohlcv_1m_snap is not None else []
         flags: list[str] = []
 
         spot, spot_source, spot_observed_at, screenshot_anchored, spot_quotes, dispersion, venue_count = (
@@ -547,7 +582,15 @@ async def gather_crypto_intelligence(
                 ),
             }
 
-        vol_multiplier = await _load_vol_multiplier(symbol)
+        calibration = await _load_calibration(symbol)
+        vol_multiplier = float(calibration.get("vol_multiplier", 1.0))
+        mom_weight = float(calibration.get("momentum_weight", 0.35))
+        flow_weight = float(calibration.get("order_flow_weight", 0.30))
+        futures_premium_bps = (
+            futures_premium_snap.premium_bps
+            if futures_premium_snap is not None
+            else 0.0
+        )
         features = build_features(
             symbol=symbol,
             spot_price=spot,
@@ -563,6 +606,10 @@ async def gather_crypto_intelligence(
             high_24h=high_24h,
             low_24h=low_24h,
             vol_multiplier=vol_multiplier,
+            momentum_weight=mom_weight,
+            order_flow_weight=flow_weight,
+            ohlcv_1m=candles_1m,
+            futures_premium_bps=futures_premium_bps,
         )
 
         flags = _merge_flags(flags, features.data_quality_flags)
@@ -590,8 +637,11 @@ async def gather_crypto_intelligence(
                 "spot_quotes": spot_quotes,
                 "spot_venue_count": venue_count,
                 "spot_dispersion_bps": round(dispersion, 2) if dispersion is not None else None,
+                "ohlcv_1m_source": _ohlcv_label(ohlcv_1m_snap),
                 "ohlcv_15m_source": _ohlcv_label(ohlcv_15m),
                 "ohlcv_1h_source": _ohlcv_label(ohlcv_1h),
+                "futures_premium_bps": round(futures_premium_bps, 2) if futures_premium_snap is not None else None,
+                "futures_mark_price": f"{futures_premium_snap.futures_price:,.2f}" if futures_premium_snap is not None else None,
                 "order_book_source": usable_book.venue if usable_book is not None else None,
                 "order_book_spread_bps": (
                     round(
@@ -616,10 +666,13 @@ async def gather_crypto_intelligence(
                     usable_book,
                     derivatives,
                     fear_greed,
+                    ohlcv_1m=ohlcv_1m_snap,
+                    futures_premium=futures_premium_snap,
                 ),
                 "data_quality_flags": flags,
                 "vol_methodology": "EWMA / Calibrated Digital Option",
                 "pricing_model": "Log-normal digital option (Black-Scholes, r=0)",
+                "learned_calibration": calibration,
             }
         )
 

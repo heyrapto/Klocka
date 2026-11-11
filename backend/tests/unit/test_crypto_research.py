@@ -180,3 +180,73 @@ async def test_missing_spot_returns_data_unavailable_not_a_fabricated_price(
     assert context["adjusted_prob_yes"] is None
     assert context["final_adjusted_prob_yes"] is None
     assert "SPOT_PRICE_UNAVAILABLE" in context["data_quality_flags"]
+
+
+def test_build_features_har_vol_blend_and_ofi() -> None:
+    from prediction_ai.specialists.crypto.features import build_features
+
+    ohlcv_1h = [_candle(100.0, age_minutes=60 * i) for i in range(30, 0, -1)]
+    ohlcv_15m = [_candle(100.0, age_minutes=15 * i) for i in range(30, 0, -1)]
+    ohlcv_1m = [_candle(100.0 + (i % 3), age_minutes=i) for i in range(25, 0, -1)]
+
+    bids = [(99.0 - i * 0.1, 10.0 + i) for i in range(10)]
+    asks = [(101.0 + i * 0.1, 5.0 + i) for i in range(10)]
+
+    features = build_features(
+        symbol="BTC",
+        spot_price=100.0,
+        strike_price=100.0,
+        seconds_to_expiry=600.0,  # 10m -> ultra short (<15m)
+        ohlcv_15m=ohlcv_15m,
+        ohlcv_1h=ohlcv_1h,
+        ohlcv_1m=ohlcv_1m,
+        bids=bids,
+        asks=asks,
+        vol_multiplier=1.0,
+    )
+
+    assert features.vol_1m_annual > 0.0
+    assert features.primary_vol_annual > 0.0
+    # For ultra short, weights are 0.60*vol_1m + 0.30*vol_15m + 0.10*vol_1h
+    expected_vol = 0.60 * features.vol_1m_annual + 0.30 * features.vol_15m_annual + 0.10 * features.vol_1h_annual
+    assert features.primary_vol_annual == pytest.approx(expected_vol, abs=1e-4)
+    ctx = features.to_context_dict()
+    assert ctx["vol_1m_annual"] != "N/A"
+    assert "sigma_distance" in ctx
+
+
+def test_build_features_futures_premium_adjustment() -> None:
+    from prediction_ai.specialists.crypto.features import build_features
+
+    ohlcv_1h = [_candle(100.0, age_minutes=60 * i) for i in range(30, 0, -1)]
+    ohlcv_15m = [_candle(100.0, age_minutes=15 * i) for i in range(30, 0, -1)]
+
+    # Positive premium > 10 bps (contango)
+    features_contango = build_features(
+        symbol="BTC",
+        spot_price=100.0,
+        strike_price=100.0,
+        seconds_to_expiry=1800.0,
+        ohlcv_15m=ohlcv_15m,
+        ohlcv_1h=ohlcv_1h,
+        bids=[(99.0, 1.0)],
+        asks=[(101.0, 1.0)],
+        futures_premium_bps=15.0,
+    )
+    # Negative premium < -10 bps (backwardation)
+    features_backwardation = build_features(
+        symbol="BTC",
+        spot_price=100.0,
+        strike_price=100.0,
+        seconds_to_expiry=1800.0,
+        ohlcv_15m=ohlcv_15m,
+        ohlcv_1h=ohlcv_1h,
+        bids=[(99.0, 1.0)],
+        asks=[(101.0, 1.0)],
+        futures_premium_bps=-15.0,
+    )
+
+    assert features_contango.futures_premium_bps == 15.0
+    assert features_backwardation.futures_premium_bps == -15.0
+    assert features_contango.adjusted_prob_yes > features_backwardation.adjusted_prob_yes
+

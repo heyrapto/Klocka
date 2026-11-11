@@ -101,6 +101,10 @@ def test_bayse_chainlink_twap_spec_captures_window_and_tie_rule() -> None:
 
 
 def test_unresolved_oracle_and_comparator_are_critical() -> None:
+    """UNKNOWN_SETTLEMENT_SOURCE is now a warning (not critical): many standard
+    Polymarket price-bracket markets resolve via the platform itself without
+    naming a named oracle in the resolution text.  UNKNOWN_COMPARATOR remains
+    critical because without it we cannot determine which side wins."""
     market = _market(
         title="Will BTC finish at 74000 today?",
         description="Resolution follows the official market rules.",
@@ -117,9 +121,13 @@ def test_unresolved_oracle_and_comparator_are_critical() -> None:
 
     assert spec.settlement_source == "unknown"
     assert spec.comparator == "unknown"
-    assert "UNKNOWN_SETTLEMENT_SOURCE" in spec.critical_flags()
+    # UNKNOWN_SETTLEMENT_SOURCE is a warning — it appears in ambiguities but NOT
+    # in critical_flags(), so the market remains potentially tradeable on that
+    # dimension alone.
+    assert "UNKNOWN_SETTLEMENT_SOURCE" not in spec.critical_flags()
+    # UNKNOWN_COMPARATOR is still critical: we cannot evaluate which side wins.
     assert "UNKNOWN_COMPARATOR" in spec.critical_flags()
-    assert spec.tradeable is False
+    assert spec.tradeable is False  # still not tradeable due to unknown comparator
 
 
 def test_missing_settlement_timestamp_is_critical() -> None:

@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -20,7 +21,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Initialize zero-daemon embedded SQLite database
     sqlite = get_sqlite_db()
     sqlite.initialize()
-    yield
+    # Pre-warm market data DNS cache in background so live analyses experience 0ms DNS latency
+    from prediction_ai.integrations.network import prewarm_market_data_dns
+
+    prewarm_task = asyncio.create_task(prewarm_market_data_dns())
+    try:
+        yield
+    finally:
+        prewarm_task.cancel()
 
 
 def create_application() -> FastAPI:

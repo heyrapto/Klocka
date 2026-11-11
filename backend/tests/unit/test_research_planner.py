@@ -84,7 +84,7 @@ class TestBuildPlan:
         t = _target("Will the manager leave before the deadline?")
         plan = build_plan(t, registry=self._registry_with_no_sources())
         fact_keys = [f.fact_key for f in plan.required_facts]
-        assert "current_manager_status" in fact_keys
+        assert "current_role_status" in fact_keys
         assert "resolution_definition" in fact_keys
         assert "deadline_semantics" in fact_keys
 

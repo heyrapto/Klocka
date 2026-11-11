@@ -121,6 +121,8 @@ class TestSourceRegistryEntry:
             "access_method": AccessMethod.OFFICIAL_API,
             "commercial_use_status": CommercialUseStatus.APPROVED,
             "enabled": True,
+            "terms_reviewed_at": _NOW_UTC,
+            "robots_reviewed_at": _NOW_UTC,
             "created_at": _NOW_UTC,
             "updated_at": _NOW_UTC,
         }

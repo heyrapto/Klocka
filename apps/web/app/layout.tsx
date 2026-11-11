@@ -2,6 +2,7 @@ import type { Metadata, Viewport } from "next";
 import { DM_Sans, Instrument_Serif } from "next/font/google";
 
 import "./globals.css";
+import { PredictionSuccessProvider } from "@/components/ui/prediction-success-context";
 
 const dmSans = DM_Sans({
   subsets: ["latin"],
@@ -49,7 +50,9 @@ export default function RootLayout({
       lang="en"
       className={`${dmSans.variable} ${instrumentSerif.variable} h-full antialiased font-sans`}
     >
-      <body className="min-h-full bg-canvas text-zinc-900">{children}</body>
+      <body className="min-h-full bg-canvas text-zinc-900">
+        <PredictionSuccessProvider>{children}</PredictionSuccessProvider>
+      </body>
     </html>
   );
 }

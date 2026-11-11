@@ -361,6 +361,40 @@ class BudgetLimits(_UTCBoundary):
     max_bytes_downloaded: int = Field(default=8_000_000, ge=1000, le=100_000_000)
     max_redirects: int = Field(default=3, ge=0, le=10)
 
+    @classmethod
+    def from_depth(cls, depth: ResearchDepth) -> "BudgetLimits":
+        """Return the bounded guardrail preset for a research depth profile."""
+
+        if depth is ResearchDepth.QUICK:
+            return cls(
+                research_rounds=1,
+                search_requests=6,
+                source_documents=4,
+                browser_pages=2,
+                max_link_depth=0,
+                llm_calls=1,
+                structured_output_repairs=1,
+                wall_clock_seconds=20,
+                max_requests_per_provider=4,
+                max_bytes_downloaded=4_000_000,
+                max_redirects=2,
+            )
+        if depth is ResearchDepth.DEEP:
+            return cls(
+                research_rounds=3,
+                search_requests=20,
+                source_documents=12,
+                browser_pages=8,
+                max_link_depth=2,
+                llm_calls=3,
+                structured_output_repairs=1,
+                wall_clock_seconds=90,
+                max_requests_per_provider=10,
+                max_bytes_downloaded=16_000_000,
+                max_redirects=3,
+            )
+        return cls()
+
 
 class BudgetUsage(_UTCBoundary):
     counters: dict[str, int] = Field(default_factory=dict)

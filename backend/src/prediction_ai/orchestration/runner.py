@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -672,6 +673,43 @@ class AnalysisWorkflowRunner:
         )
 
         # -------------------------------------------------------------
+        # PRE-DECISION ORDER BOOK REFRESH
+        # Gemini forecasting can take 1–3 minutes.  The order book snapshot
+        # fetched during DATA_COLLECTION is therefore always stale by the time
+        # we reach DECISION_EVALUATION, causing STALE_QUOTE abstention on every
+        # slow LLM call.  The correct fix is not to inflate the age threshold
+        # (which would let arbitrarily old prices through) but to re-fetch the
+        # book right before we evaluate the decision — a fresh, executable quote.
+        #
+        # We attempt a lightweight re-fetch and fall back to the original book
+        # if it fails so the pipeline never hard-fails purely due to a refresh
+        # timeout.  The source of the quote used for the decision is recorded in
+        # execution_snapshot for full auditability (engineering-rules §1.5).
+        # -------------------------------------------------------------
+        order_book_refreshed = False
+        try:
+            refreshed_book = await asyncio.wait_for(
+                adapter.get_order_book(best_market),
+                timeout=10.0,
+            )
+            order_book = refreshed_book
+            order_book_refreshed = True
+            logger.info(
+                "Order book refreshed before decision evaluation",
+                platform=best_market.platform,
+                market_id=best_market.platform_market_id,
+            )
+        except Exception as _refresh_err:
+            # Non-fatal: continue with the original book and let the quote-age
+            # gate decide whether it is still within tolerance.
+            logger.warning(
+                "Pre-decision order book refresh failed; using original snapshot",
+                platform=best_market.platform,
+                market_id=best_market.platform_market_id,
+                error=type(_refresh_err).__name__,
+            )
+
+        # -------------------------------------------------------------
         # STAGE 8: DECISION EVALUATION
         # -------------------------------------------------------------
         await recorder.emit(
@@ -725,6 +763,57 @@ class AnalysisWorkflowRunner:
         )
         strict_crypto = category == "crypto" and self.settings.CONTRACT_SPEC_STRICT_CRYPTO
 
+        # Apply learned uncertainty_margin from asset_calibration when available.
+        # The postmortem loop updates this column to tighten or widen the edge
+        # threshold based on past abstention outcomes.
+        _default_margin = Decimal(str(self.settings.DECISION_UNCERTAINTY_MARGIN))
+        learned_calibration: dict[str, Any] = (
+            crypto_research.get("learned_calibration") or {}
+            if category == "crypto"
+            else {}
+        )
+        _cal_margin_raw = learned_calibration.get("uncertainty_margin")
+        if _cal_margin_raw is not None:
+            try:
+                _cal_margin = Decimal(str(round(float(_cal_margin_raw), 4)))
+                # Clamp to [0.005, 0.10] — never allow a learned value to
+                # collapse the edge gate to zero or expand it unreasonably.
+                if Decimal("0.005") <= _cal_margin <= Decimal("0.10"):
+                    effective_uncertainty_margin = _cal_margin
+                else:
+                    effective_uncertainty_margin = _default_margin
+            except Exception:
+                effective_uncertainty_margin = _default_margin
+        else:
+            effective_uncertainty_margin = _default_margin
+
+        # Confidence-adaptive edge adjustment using σ-distance.
+        # When the market is far from the strike (σ-distance > 1.5), the outcome
+        # is directionally clear — reduce the uncertainty buffer so we don't
+        # over-gate on easy trades.  When near the strike (< 0.3), oracle/model
+        # mismatch risk is highest — tighten the buffer.
+        # This applies on top of the learned calibration margin.
+        if category == "crypto":
+            _sigma_dist_raw = (crypto_research.get("sigma_distance") or "0.0")
+            try:
+                _sigma_dist = float(_sigma_dist_raw)
+            except (ValueError, TypeError):
+                _sigma_dist = 0.0
+
+            signal_confidence = crypto_research.get("signal_confidence", "medium")
+            if _sigma_dist >= 1.5 and signal_confidence == "high":
+                # Far from strike + high-quality data: relax buffer by 0.5%
+                effective_uncertainty_margin = max(
+                    Decimal("0.005"),
+                    effective_uncertainty_margin - Decimal("0.005"),
+                )
+            elif _sigma_dist < 0.3:
+                # Near knife-edge: tighten buffer (require more edge)
+                effective_uncertainty_margin = min(
+                    Decimal("0.08"),
+                    effective_uncertainty_margin + Decimal("0.02"),
+                )
+
         decision = evaluate_decision(
             probability_yes=forecast_result.probability_yes,
             ask_yes=ask_yes,
@@ -732,7 +821,7 @@ class AnalysisWorkflowRunner:
             min_edge=Decimal(str(self.settings.DECISION_MIN_EDGE)),
             max_spread=Decimal(str(self.settings.DECISION_MAX_SPREAD)),
             spread=spread_value,
-            uncertainty_margin=Decimal(str(self.settings.DECISION_UNCERTAINTY_MARGIN)),
+            uncertainty_margin=effective_uncertainty_margin,
             taker_fee_rate_yes=best_market.taker_fee_rate,
             taker_fee_rate_no=best_market.taker_fee_rate,
             fee_model=best_market.fee_model,
@@ -762,6 +851,7 @@ class AnalysisWorkflowRunner:
         execution_snapshot = {
             "observed_at": order_book.observed_at.isoformat(),
             "quote_age_seconds": str(quote_age_seconds),
+            "quote_refreshed": order_book_refreshed,
             "ask_yes": str(ask_yes) if ask_yes is not None else None,
             "ask_no": str(ask_no) if ask_no is not None else None,
             "spread": str(spread_value) if spread_value is not None else None,
@@ -790,6 +880,12 @@ class AnalysisWorkflowRunner:
                 "observed_at": order_book.observed_at.isoformat(),
                 "quality_flags": order_book.quality_flags,
                 "depth_known": order_book.depth_known,
+            },
+            "decision_gate_inputs": {
+                "sigma_distance": crypto_research.get("sigma_distance") if category == "crypto" else None,
+                "signal_confidence": crypto_research.get("signal_confidence") if category == "crypto" else None,
+                "effective_uncertainty_margin": str(effective_uncertainty_margin),
+                "order_book_refreshed": order_book_refreshed,
             },
         }
         model_components = {
@@ -910,4 +1006,10 @@ class AnalysisWorkflowRunner:
             "Pipeline completed successfully",
             analysis_id=str(analysis_id),
             recommendation=decision.recommendation,
+            reason=decision.reason,
+            gating_flags=decision.gating_flags,
+            sigma_distance=crypto_research.get("sigma_distance") if category == "crypto" else None,
+            signal_confidence=crypto_research.get("signal_confidence") if category == "crypto" else None,
+            effective_uncertainty_margin=str(effective_uncertainty_margin),
+            order_book_refreshed=order_book_refreshed,
         )

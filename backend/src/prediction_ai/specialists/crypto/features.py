@@ -81,6 +81,37 @@ def prob_below_strike(
     return 1.0 - prob_above_strike(spot, strike, vol_annual, seconds_to_expiry)
 
 
+def compute_sigma_distance(
+    spot: float,
+    strike: float,
+    vol_annual: float,
+    seconds_to_expiry: float,
+) -> float:
+    """
+    Strike distance in units of one standard deviation of price movement.
+
+    σ-distance = |ln(S/K)| / (σ · √T)
+
+    Interpretation:
+      < 0.3  → knife-edge: small data errors can flip the outcome
+      0.3–1.0 → moderate distance: standard probability model applies
+      > 1.0  → comfortable margin: outcome is directionally likely
+      > 2.0  → near-certain: very strong edge, trade with high confidence
+
+    This is the single most important risk-management quantity for binary
+    prediction markets because it captures both the absolute dollar distance
+    to the strike AND how much time + volatility is left for the market to
+    travel that distance.
+    """
+    if spot <= 0 or strike <= 0 or vol_annual <= 0 or seconds_to_expiry <= 0:
+        return 0.0
+    T = seconds_to_expiry / (365 * 24 * 3600)
+    sigma_sqrt_T = vol_annual * math.sqrt(T)
+    if sigma_sqrt_T < 1e-9:
+        return 10.0  # effectively at expiry — treat as very far from strike
+    return abs(math.log(spot / strike)) / sigma_sqrt_T
+
+
 # ---------------------------------------------------------------------------
 # Volatility calculation from OHLCV data
 # ---------------------------------------------------------------------------
@@ -161,7 +192,8 @@ def rsi(closes: list[float], period: int = 14) -> float | None:
     """Calculate RSI. Returns None if insufficient data."""
     if len(closes) < period + 1:
         return None
-    gains, losses = [], []
+    gains: list[float] = []
+    losses: list[float] = []
     for i in range(1, period + 1):
         delta = closes[-period + i] - closes[-period + i - 1]
         (gains if delta > 0 else losses).append(abs(delta))
@@ -393,6 +425,7 @@ class CryptoMarketFeatures:
     vol_24h_annual: float
     primary_vol_annual: float          # the vol used for the main calc
     base_prob_yes: float               # log-normal P(price > strike)
+    vol_1m_annual: float = 0.0
 
     # Technical signals
     rsi_15m: float | None = None
@@ -414,10 +447,12 @@ class CryptoMarketFeatures:
     funding_adjustment: float = 0.0
     oi_signal: str = "neutral"
     oi_adjustment: float = 0.0
+    futures_premium_bps: float = 0.0
 
     # Composite output
     adjusted_prob_yes: float = 0.0     # base_prob + all signal adjustments
     signal_confidence: str = "medium"  # "high", "medium", "low"
+    sigma_distance: float = 0.0        # |ln(S/K)| / (σ·√T) — strike distance in vol units
     key_signals: list[str] = field(default_factory=list)
     data_quality_flags: list[str] = field(default_factory=list)
 
@@ -432,6 +467,7 @@ class CryptoMarketFeatures:
             "horizon": self.horizon_label,
             "log_normal_prob_yes": f"{self.base_prob_yes:.4f}",
             "primary_annualized_vol": f"{self.primary_vol_annual:.2%}",
+            "vol_1m_annual": f"{self.vol_1m_annual:.2%}" if self.vol_1m_annual > 0 else "N/A",
             "adjusted_prob_yes": f"{self.adjusted_prob_yes:.4f}",
             "rsi_15m": f"{self.rsi_15m:.1f}" if self.rsi_15m else "N/A",
             "rsi_1h": f"{self.rsi_1h:.1f}" if self.rsi_1h else "N/A",
@@ -442,7 +478,9 @@ class CryptoMarketFeatures:
             "funding_rate_pct_per_8h": f"{self.funding_rate_pct:.4f}%",
             "funding_signal": self.funding_signal,
             "oi_signal": self.oi_signal,
+            "futures_premium_bps": f"{self.futures_premium_bps:+.1f}",
             "signal_confidence": self.signal_confidence,
+            "sigma_distance": f"{self.sigma_distance:.3f}",
             "key_signals": self.key_signals,
             "data_quality_flags": self.data_quality_flags,
             "methodology": "log_normal_pricing + microstructure + momentum",
@@ -464,6 +502,10 @@ def build_features(
     high_24h: float = 0.0,
     low_24h: float = 0.0,
     vol_multiplier: float = 1.0,
+    momentum_weight: float = 0.35,
+    order_flow_weight: float = 0.30,
+    ohlcv_1m: list[dict[str, float]] | None = None,
+    futures_premium_bps: float = 0.0,
 ) -> CryptoMarketFeatures:
     """
     Compute all quantitative features for a crypto price-bracket market.
@@ -498,13 +540,28 @@ def build_features(
     vol_1h = ewma_vol(closes_1h, 60) if closes_1h else 0.80
     vol_24h = realized_vol_annualized(closes_1h[-24:], 60) if len(closes_1h) >= 24 else vol_1h
 
+    closes_1m = [c["c"] for c in (ohlcv_1m or []) if c.get("c", 0) > 0]
+    vol_1m = ewma_vol(closes_1m, 1, lam=0.90) if len(closes_1m) >= 20 else 0.0
+
     # Choose vol based on horizon and apply learned calibration multiplier
-    if seconds_to_expiry <= 3600:
-        primary_vol = vol_15m * vol_multiplier
-    elif seconds_to_expiry <= 14400:
-        primary_vol = vol_1h * vol_multiplier
+    if vol_1m > 0:
+        # HAR-style multi-window vol blend — weights sum to 1.0
+        if seconds_to_expiry < 900:          # < 15 min
+            primary_vol = (0.60 * vol_1m + 0.30 * vol_15m + 0.10 * vol_1h) * vol_multiplier
+        elif seconds_to_expiry <= 3600:      # 15m–1h
+            primary_vol = (0.30 * vol_1m + 0.50 * vol_15m + 0.20 * vol_1h) * vol_multiplier
+        elif seconds_to_expiry <= 14400:     # 1h–4h
+            primary_vol = (0.10 * vol_1m + 0.40 * vol_15m + 0.50 * vol_1h) * vol_multiplier
+        else:                                 # > 4h
+            primary_vol = (0.05 * vol_1m + 0.25 * vol_15m + 0.70 * vol_1h) * vol_multiplier
     else:
-        primary_vol = vol_24h * vol_multiplier
+        # Fallback: original single-window selection
+        if seconds_to_expiry <= 3600:
+            primary_vol = vol_15m * vol_multiplier
+        elif seconds_to_expiry <= 14400:
+            primary_vol = vol_1h * vol_multiplier
+        else:
+            primary_vol = vol_24h * vol_multiplier
 
     # --- Log-normal base probability ---
     base_p = prob_above_strike(spot_price, strike_price, primary_vol, seconds_to_expiry)
@@ -550,26 +607,32 @@ def build_features(
     # --- Assemble adjustments ---
     total_adj = 0.0
 
+    # Learned calibration scaling (baseline: momentum=0.35, order_flow=0.30)
+    mom_scale = max(0.2, min(2.0, momentum_weight / 0.35))
+    flow_scale = max(0.2, min(2.0, order_flow_weight / 0.30))
+
     # RSI adjustment (overbought/oversold)
     rsi_to_use = rsi_15m_val if seconds_to_expiry <= 3600 else rsi_1h_val
     if rsi_to_use is not None:
         if rsi_to_use > 75:
-            total_adj -= 0.03
+            total_adj -= 0.03 * mom_scale
             key_signals.append(f"RSI {rsi_to_use:.0f} → overbought; slight downward pressure")
         elif rsi_to_use < 25:
-            total_adj += 0.03
+            total_adj += 0.03 * mom_scale
             key_signals.append(f"RSI {rsi_to_use:.0f} → oversold; potential bounce")
         elif rsi_to_use > 55:
+            total_adj += 0.015 * mom_scale
             key_signals.append(f"RSI {rsi_to_use:.0f} → mild bullish momentum")
         elif rsi_to_use < 45:
+            total_adj -= 0.015 * mom_scale
             key_signals.append(f"RSI {rsi_to_use:.0f} → mild bearish momentum")
 
     # EMA cross
     if ema_cross == "bullish":
-        total_adj += 0.02
+        total_adj += 0.02 * mom_scale
         key_signals.append("EMA9 > EMA21: bullish momentum confirmed")
     elif ema_cross == "bearish":
-        total_adj -= 0.02
+        total_adj -= 0.02 * mom_scale
         key_signals.append("EMA9 < EMA21: bearish momentum")
 
     # Bollinger
@@ -583,7 +646,22 @@ def build_features(
 
     # Order book pressure (only for short horizon)
     if seconds_to_expiry <= 3600:
-        ob_adj = ob_signals.depth_imbalance * 0.03
+        # 5-level weighted Order Flow Imbalance (more accurate than raw depth_imbalance)
+        def _ofi(levels: int = 5) -> float:
+            weights = [1.0 / (i + 1) for i in range(levels)]
+            bid_p = sum(
+                weights[i] * bids[i][0] * bids[i][1]
+                for i in range(min(levels, len(bids)))
+            )
+            ask_p = sum(
+                weights[i] * asks[i][0] * asks[i][1]
+                for i in range(min(levels, len(asks)))
+            )
+            total = bid_p + ask_p
+            return (bid_p - ask_p) / total if total > 0 else 0.0
+
+        ofi_signal = _ofi()
+        ob_adj = ofi_signal * 0.04 * flow_scale  # slightly higher weight than raw depth
         total_adj += ob_adj
         if abs(ob_signals.depth_imbalance) > 0.2:
             key_signals.append(
@@ -606,6 +684,15 @@ def build_features(
     total_adj += oi_adj
     if abs(oi_adj) > 0.01:
         key_signals.append(f"OI signal: {oi_info['signal']}")
+
+    # Futures premium vs spot (basis signal)
+    if abs(futures_premium_bps) > 10.0:
+        fp_adj = 0.01 if futures_premium_bps > 0 else -0.01
+        total_adj += fp_adj
+        key_signals.append(
+            f"Futures premium {futures_premium_bps:+.1f}bps → "
+            f"{'contango (mild bullish)' if futures_premium_bps > 0 else 'backwardation (mild bearish)'}"
+        )
 
     # Clamp total adjustment to avoid overcorrection
     total_adj = max(-0.15, min(0.15, total_adj))
@@ -632,6 +719,7 @@ def build_features(
         vol_24h_annual=vol_24h,
         primary_vol_annual=primary_vol,
         base_prob_yes=base_p,
+        vol_1m_annual=vol_1m,
         rsi_15m=rsi_15m_val,
         rsi_1h=rsi_1h_val,
         ema9_vs_ema21=ema_cross,
@@ -647,8 +735,10 @@ def build_features(
         funding_adjustment=funding_adj,
         oi_signal=oi_info["signal"],
         oi_adjustment=oi_adj,
+        futures_premium_bps=futures_premium_bps,
         adjusted_prob_yes=adjusted_p,
         signal_confidence=confidence,
+        sigma_distance=compute_sigma_distance(spot_price, strike_price, primary_vol, seconds_to_expiry),
         key_signals=key_signals[:8],  # cap for prompt brevity
         data_quality_flags=flags,
     )

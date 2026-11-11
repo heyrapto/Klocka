@@ -26,7 +26,9 @@ class PostmortemOutputSchema(BaseModel):
         ...,
         description=(
             "One of: ACCURATE_CONVICTION, VOLATILITY_BURST, FALSE_BREAKOUT_TRAP, "
-            "FUNDING_RATE_SQUEEZE, LIQUIDITY_EVAPORATION, PIN_RISK_DRIFT, THETA_MISCALCULATION"
+            "FUNDING_RATE_SQUEEZE, LIQUIDITY_EVAPORATION, PIN_RISK_DRIFT, THETA_MISCALCULATION, "
+            "ABSTENTION_ALIGNED_LEAN, ABSTENTION_SAVED_CAPITAL, ABSTENTION_VOLATILITY_EXPANSION, "
+            "ABSTENTION_REGIME_UNCERTAINTY"
         ),
     )
     visual_observations: str | None = Field(
@@ -96,6 +98,9 @@ Analytical Framework:
    - Funding Squeeze: Negative/positive funding rate triggered an aggressive liquidation cascade.
    - Liquidity Evaporation: Thin order book depth near expiry allowed small volume to flip the outcome.
    - Pin Risk: Spot finished within 0.05% of strike, rendering the binary option an unpredictable coin flip.
+   - Abstention Aligned Lean: The recommendation was NO_TRADE, but the model's assigned probability tilted in the direction of the eventual resolution. Diagnose why the trade was gated: was the edge too thin, spread too wide, or was the volatility multiplier/uncertainty buffer set too conservatively? Determine how to calibrate signals so the model gains surer conviction on similar setups.
+   - Abstention Saved Capital: The recommendation was NO_TRADE, and the market chopped or went against initial momentum. The risk gate correctly saved the trader from a loss or fee drag. Identify the noise signals that were correctly filtered out.
+   - Abstention Volatility Expansion: The recommendation was NO_TRADE, and a sudden volatility expansion broke through the strike. Identify the catalyst and adjust volatility scaling.
 4. Parameter Calibration: Output actionable quantitative parameter deltas so future intervals dynamically learn and improve.
 """
 
@@ -135,36 +140,17 @@ async def run_postmortem_analysis(
         was_correct = True
     elif recommendation in ("BUY_NO", "BUY_DOWN") and is_negative_outcome:
         was_correct = True
-    # A NO_TRADE recommendation is an abstention, not a correct prediction.
-    # It is deliberately not counted in accuracy or calibration updates.
+    elif is_abstention:
+        # For abstentions, evaluate whether the model's assigned probability leaned
+        # in the direction of the actual outcome. This allows the postmortem agent to
+        # evaluate whether a valid edge was missed by an overly conservative gate,
+        # or if the abstention successfully preserved capital against market noise.
+        if (probability_yes > 0.50 and is_affirmative_outcome) or (probability_yes < 0.50 and is_negative_outcome):
+            was_correct = True
 
     # Compute Brier score component: (probability_yes - outcome_indicator)^2
     outcome_indicator = 1.0 if is_affirmative_outcome else 0.0
     brier_loss = round((probability_yes - outcome_indicator) ** 2, 4)
-
-    # Abstentions get a deterministic, non-mutating postmortem.  Running a
-    # generative diagnosis on a trade that was never recommended would invent
-    # causal lessons from a non-event.
-    if is_abstention:
-        return _heuristic_postmortem(
-            symbol=symbol,
-            category=category,
-            recommendation=recommendation,
-            probability_yes=probability_yes,
-            actual_outcome=actual_outcome,
-            was_correct=False,
-            brier_loss=brier_loss,
-            settled_price=settled_price,
-            strike_price=strike_price,
-            specialist_context=specialist_context,
-            user_notes=user_notes,
-            visual_observations=(
-                "Settlement screenshot ingested; no trade was recommended."
-                if settlement_image_bytes
-                else None
-            ),
-            evaluation_eligible=False,
-        )
 
     # Check if Gemini API is configured for deep generative reflection
     api_key = settings.GEMINI_API_KEY.get_secret_value() if settings.GEMINI_API_KEY else None
@@ -260,15 +246,31 @@ def _build_diagnostic_prompt(
     user_notes: str | None,
     specialist_context: dict[str, Any] | None,
 ) -> str:
+    is_abstention = recommendation == "NO_TRADE"
+    directional_lean = (
+        "UP / YES"
+        if probability_yes > 0.51
+        else "DOWN / NO"
+        if probability_yes < 0.49
+        else "NEUTRAL / BALANCED"
+    )
     parts = [
         "TRADE SETTLEMENT AUDIT:",
         f"- Market Proposition: {market_title}",
         f"- Asset / Category: {symbol} ({category})",
         f"- Recommended Action: {recommendation}",
-        f"- Model Probability P(YES): {probability_yes:.3f}",
+        f"- Model Probability P(YES): {probability_yes:.3f} (Implied Directional Lean: {directional_lean})",
         f"- Actual Settlement Outcome: {actual_outcome}",
-        f"- Outcome Aligned: {'YES (Prediction Correct)' if was_correct else 'NO (Prediction Discrepancy)'}",
     ]
+    if is_abstention:
+        parts.append(
+            f"- Abstention Audit Alignment: {'Model probability tilted toward the winning outcome (Missed opportunity vs fee drag)' if was_correct else 'Model tilted against outcome or stayed neutral (Capital preserved by risk gate)'}"
+        )
+    else:
+        parts.append(
+            f"- Outcome Aligned: {'YES (Prediction Correct)' if was_correct else 'NO (Prediction Discrepancy)'}"
+        )
+
     if settled_price:
         parts.append(f"- Final Settled Spot Price: ${settled_price:,.2f}")
     if strike_price:
@@ -280,12 +282,33 @@ def _build_diagnostic_prompt(
         crypto_res = specialist_context.get("crypto_research", {})
         parts.append("")
         parts.append("PRE-TRADE SPECIALIST CONTEXT & FEATURES:")
-        for k in ("spot_price", "annual_volatility_pct", "rsi_15m", "order_book_depth_ratio", "funding_rate_pct_8h", "base_prob_yes"):
+        for k in (
+            "spot_price",
+            "annual_volatility_pct",
+            "rsi_15m",
+            "rsi_1h",
+            "ema_cross_signal",
+            "order_book_depth_ratio",
+            "order_book_pressure",
+            "funding_rate_pct_8h",
+            "base_prob_yes",
+            "adjusted_prob_yes",
+            "final_adjusted_prob_yes",
+        ):
             if k in crypto_res:
                 parts.append(f"- {k}: {crypto_res[k]}")
 
     parts.append("")
-    parts.append("Diagnose the causal drivers of this settlement outcome and output your structured reflection.")
+    if is_abstention:
+        parts.append(
+            "ABSTENTION LEARNING DIRECTIVE:\n"
+            f"1. Explain why the market moved and settled as {actual_outcome}.\n"
+            "2. Scrutinize the technical signals (RSI, EMA, order book pressure, volatility): did any signal correctly anticipate this outcome?\n"
+            f"3. Evaluate the decision to abstain: was it a disciplined save (avoiding noise/fee burn) or an overly cautious miss where a surer conviction could have been formed?\n"
+            "4. Provide concrete, mathematical key learnings and parameter deltas (vol_multiplier_delta, momentum_weight_delta, order_flow_weight_delta, uncertainty_margin_delta) so future forecasts can weight these patterns more accurately."
+        )
+    else:
+        parts.append("Diagnose the causal drivers of this settlement outcome and output your structured reflection.")
     return "\n".join(parts)
 
 
@@ -310,26 +333,65 @@ def _heuristic_postmortem(
     depth_ratio = crypto_res.get("order_book_depth_ratio", 1.0)
     funding = crypto_res.get("funding_rate_pct_8h", 0.0)
 
-    if not evaluation_eligible:
+    # ------------------------------------------------------------------
+    # Abstention Causal Audit & Learning Heuristics
+    # ------------------------------------------------------------------
+    if recommendation == "NO_TRADE":
+        norm_outcome = actual_outcome.strip().upper()
+        is_aff = norm_outcome in ("YES", "UP", "HIGHER", "BUY_UP", "BUY UP")
+        is_aligned_lean = (probability_yes > 0.50 and is_aff) or (probability_yes < 0.50 and not is_aff)
+        lean_dir = "UP" if probability_yes > 0.50 else "DOWN" if probability_yes < 0.50 else "NEUTRAL"
+
+        dist_pct = 0.0
+        if settled_price is not None and strike_price is not None and strike_price > 0:
+            dist_pct = (settled_price - strike_price) / strike_price
+
+        if is_aligned_lean:
+            classification = "ABSTENTION_ALIGNED_LEAN"
+            analysis = (
+                f"Model probability assigned P(YES)={probability_yes:.1%} (leaning {lean_dir}), "
+                f"which aligned with the eventual settlement as {actual_outcome}. "
+                "The trade was gated as NO_TRADE due to spread, taker fees, or the uncertainty buffer. "
+                "Calibrating momentum and volatility weights to capture high-conviction microstructures."
+            )
+            learnings = [
+                f"Model directional lean ({lean_dir}) correctly anticipated the {actual_outcome} resolution.",
+                "Review uncertainty buffer: if momentum indicators align with order flow, allow aggressive edge calculation.",
+                f"Settlement finished {abs(dist_pct) * 100.0:.2f}% from strike; price drift followed underlying momentum.",
+            ]
+            vol_delta = -0.05 if abs(dist_pct) < 0.005 else 0.02
+            mom_delta = 0.03
+            flow_delta = 0.02
+            unc_delta = -0.005
+        else:
+            classification = "ABSTENTION_SAVED_CAPITAL"
+            analysis = (
+                f"Contract settled as {actual_outcome}, while the model's probability distribution "
+                f"was neutral or leaned {lean_dir}. The disciplined NO_TRADE recommendation "
+                "successfully prevented opening a losing or fee-negative position in adverse conditions."
+            )
+            learnings = [
+                f"Disciplined risk gate avoided unprofitable execution on choppy {symbol} microstructure.",
+                "Reinforce volatility buffer when RSI and order flow divergence signals conflict.",
+                "Maintain baseline capital preservation threshold on ambiguous setups.",
+            ]
+            vol_delta = 0.05
+            mom_delta = -0.02
+            flow_delta = -0.02
+            unc_delta = 0.005
+
         return PostmortemResult(
-            was_correct=False,
-            evaluation_eligible=False,
+            was_correct=is_aligned_lean,
+            evaluation_eligible=True,
             brier_loss=brier_loss,
-            discrepancy_classification="ABSTENTION_NO_TRADE",
-            postmortem_analysis=(
-                f"No trade was recommended for this contract, so settlement as "
-                f"{actual_outcome} is not scored as a correct or incorrect prediction. "
-                "The probability forecast remains eligible for calibration scoring."
-            ),
+            discrepancy_classification=classification,
+            postmortem_analysis=analysis,
             visual_observations=visual_observations,
-            key_learnings=[
-                "Preserve the abstention: a skipped trade is not a win or a loss.",
-                "Only update decision weights when a recommendation was actually made.",
-            ],
-            vol_multiplier_delta=0.0,
-            momentum_weight_delta=0.0,
-            order_flow_weight_delta=0.0,
-            uncertainty_margin_delta=0.0,
+            key_learnings=learnings,
+            vol_multiplier_delta=vol_delta,
+            momentum_weight_delta=mom_delta,
+            order_flow_weight_delta=flow_delta,
+            uncertainty_margin_delta=unc_delta,
         )
 
     if was_correct:
