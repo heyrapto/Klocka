@@ -7,14 +7,12 @@ learnings, and generates quantitative parameter updates for the SQLite Knowledge
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
-from decimal import Decimal
 from typing import Any
 
 import structlog
 from google import genai
-from google.genai import errors, types
+from google.genai import types
 from pydantic import BaseModel, Field
 
 from prediction_ai.core.config import Settings
@@ -77,6 +75,7 @@ class PostmortemResult:
     brier_loss: float
     discrepancy_classification: str
     postmortem_analysis: str
+    evaluation_eligible: bool = True
     visual_observations: str | None = None
     key_learnings: list[str] = field(default_factory=list)
     vol_multiplier_delta: float = 0.0
@@ -123,19 +122,49 @@ async def run_postmortem_analysis(
     norm_outcome = actual_outcome.strip().upper()
     is_affirmative_outcome = norm_outcome in ("YES", "UP", "HIGHER", "BUY_UP", "BUY UP")
     is_negative_outcome = norm_outcome in ("NO", "DOWN", "LOWER", "BUY_DOWN", "BUY DOWN")
+    if not is_affirmative_outcome and not is_negative_outcome:
+        raise ValueError(
+            "Settlement outcome must be one of YES/NO, UP/DOWN, HIGHER/LOWER, "
+            f"or BUY UP/BUY DOWN; got {actual_outcome!r}."
+        )
+
+    is_abstention = recommendation == "NO_TRADE"
 
     was_correct = False
     if recommendation in ("BUY_YES", "BUY_UP") and is_affirmative_outcome:
         was_correct = True
     elif recommendation in ("BUY_NO", "BUY_DOWN") and is_negative_outcome:
         was_correct = True
-    elif recommendation == "NO_TRADE":
-        # Abstention is considered aligned if edge was thin or market was a coin toss
-        was_correct = True
+    # A NO_TRADE recommendation is an abstention, not a correct prediction.
+    # It is deliberately not counted in accuracy or calibration updates.
 
     # Compute Brier score component: (probability_yes - outcome_indicator)^2
     outcome_indicator = 1.0 if is_affirmative_outcome else 0.0
     brier_loss = round((probability_yes - outcome_indicator) ** 2, 4)
+
+    # Abstentions get a deterministic, non-mutating postmortem.  Running a
+    # generative diagnosis on a trade that was never recommended would invent
+    # causal lessons from a non-event.
+    if is_abstention:
+        return _heuristic_postmortem(
+            symbol=symbol,
+            category=category,
+            recommendation=recommendation,
+            probability_yes=probability_yes,
+            actual_outcome=actual_outcome,
+            was_correct=False,
+            brier_loss=brier_loss,
+            settled_price=settled_price,
+            strike_price=strike_price,
+            specialist_context=specialist_context,
+            user_notes=user_notes,
+            visual_observations=(
+                "Settlement screenshot ingested; no trade was recommended."
+                if settlement_image_bytes
+                else None
+            ),
+            evaluation_eligible=False,
+        )
 
     # Check if Gemini API is configured for deep generative reflection
     api_key = settings.GEMINI_API_KEY.get_secret_value() if settings.GEMINI_API_KEY else None
@@ -186,6 +215,7 @@ async def run_postmortem_analysis(
                 parsed = PostmortemOutputSchema.model_validate_json(clean)
                 return PostmortemResult(
                     was_correct=was_correct,
+                    evaluation_eligible=True,
                     brier_loss=brier_loss,
                     discrepancy_classification=parsed.discrepancy_classification,
                     postmortem_analysis=parsed.postmortem_analysis,
@@ -272,6 +302,7 @@ def _heuristic_postmortem(
     specialist_context: dict[str, Any] | None,
     user_notes: str | None,
     visual_observations: str | None = None,
+    evaluation_eligible: bool = True,
 ) -> PostmortemResult:
     """Deterministic financial heuristics when LLM is unavailable."""
     crypto_res = (specialist_context or {}).get("crypto_research", {})
@@ -279,9 +310,32 @@ def _heuristic_postmortem(
     depth_ratio = crypto_res.get("order_book_depth_ratio", 1.0)
     funding = crypto_res.get("funding_rate_pct_8h", 0.0)
 
+    if not evaluation_eligible:
+        return PostmortemResult(
+            was_correct=False,
+            evaluation_eligible=False,
+            brier_loss=brier_loss,
+            discrepancy_classification="ABSTENTION_NO_TRADE",
+            postmortem_analysis=(
+                f"No trade was recommended for this contract, so settlement as "
+                f"{actual_outcome} is not scored as a correct or incorrect prediction. "
+                "The probability forecast remains eligible for calibration scoring."
+            ),
+            visual_observations=visual_observations,
+            key_learnings=[
+                "Preserve the abstention: a skipped trade is not a win or a loss.",
+                "Only update decision weights when a recommendation was actually made.",
+            ],
+            vol_multiplier_delta=0.0,
+            momentum_weight_delta=0.0,
+            order_flow_weight_delta=0.0,
+            uncertainty_margin_delta=0.0,
+        )
+
     if was_correct:
         return PostmortemResult(
             was_correct=True,
+            evaluation_eligible=True,
             brier_loss=brier_loss,
             discrepancy_classification="ACCURATE_CONVICTION",
             postmortem_analysis=(
@@ -380,6 +434,7 @@ def _heuristic_postmortem(
 
     return PostmortemResult(
         was_correct=False,
+        evaluation_eligible=True,
         brier_loss=brier_loss,
         discrepancy_classification=classification,
         postmortem_analysis=analysis,

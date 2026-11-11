@@ -12,10 +12,8 @@ from __future__ import annotations
 import math
 import statistics
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
-
 
 # ---------------------------------------------------------------------------
 # Normal CDF — Abramowitz & Stegun approximation (error < 7.5e-8)
@@ -190,11 +188,17 @@ def vwap(highs: list[float], lows: list[float], closes: list[float], volumes: li
     """Volume-weighted average price."""
     if not (highs and lows and closes and volumes):
         return None
-    typical_prices = [(h + l + c) / 3 for h, l, c in zip(highs, lows, closes)]
+    typical_prices = [
+        (high + low + close) / 3
+        for high, low, close in zip(highs, lows, closes, strict=False)
+    ]
     total_vol = sum(volumes)
     if total_vol <= 0:
         return None
-    return sum(tp * v for tp, v in zip(typical_prices, volumes)) / total_vol
+    return (
+        sum(tp * volume for tp, volume in zip(typical_prices, volumes, strict=False))
+        / total_vol
+    )
 
 
 def bollinger_position(closes: list[float], period: int = 20, std_mult: float = 2.0) -> float | None:

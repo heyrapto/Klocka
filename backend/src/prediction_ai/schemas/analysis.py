@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Literal
 from uuid import UUID
@@ -104,7 +104,7 @@ class ScreenshotMarketCandidate(BaseModel):
             parsed = dateutil_parser.parse(v, fuzzy=True)
             # Ensure timezone-aware UTC if no tzinfo was present in the string
             if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=timezone.utc)
+                parsed = parsed.replace(tzinfo=UTC)
             return parsed
         except Exception:
             # Unrecognisable text — treat as absent rather than hard-failing
@@ -278,7 +278,16 @@ class AnalysisFeedbackRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    actual_outcome: Literal["YES", "NO", "UP", "DOWN", "HIGHER", "LOWER", "BUY UP", "BUY DOWN"] | str
+    actual_outcome: Literal[
+        "YES",
+        "NO",
+        "UP",
+        "DOWN",
+        "HIGHER",
+        "LOWER",
+        "BUY UP",
+        "BUY DOWN",
+    ]
     notes: str | None = Field(default=None, max_length=2000)
     settled_price: Decimal | None = Field(default=None, ge=0, le=1)
 
@@ -292,6 +301,7 @@ class AnalysisFeedbackResponse(BaseModel):
     analysis_id: UUID
     actual_outcome: str
     was_correct: bool
+    evaluation_eligible: bool = True
     prediction_made: str
     postmortem_analysis: str
     key_learnings: list[str]

@@ -96,6 +96,20 @@ class SQLiteStore:
                 specialist_context TEXT,
                 image_description TEXT,
                 market_data TEXT,
+                model_version TEXT,
+                calibration_version TEXT,
+                prompt_version TEXT,
+                decision_policy_version TEXT,
+                forecasted_at TEXT,
+                forecast_cutoff_at TEXT,
+                seconds_to_target REAL,
+                target_definition TEXT,
+                contract_spec TEXT,
+                input_snapshot TEXT,
+                feature_snapshot TEXT,
+                model_components TEXT,
+                data_quality TEXT,
+                timing_provenance TEXT,
                 created_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_forecasts_analysis ON forecasts(analysis_id);
@@ -109,6 +123,9 @@ class SQLiteStore:
                 recommendation TEXT,
                 actual_outcome TEXT NOT NULL,
                 was_correct INTEGER NOT NULL,
+                evaluation_eligible INTEGER NOT NULL DEFAULT 1,
+                probability_yes REAL,
+                contract_spec_hash TEXT,
                 settled_price REAL,
                 user_notes TEXT,
                 postmortem_analysis TEXT,
@@ -141,11 +158,54 @@ class SQLiteStore:
                 ("visual_observations", "TEXT"),
                 ("discrepancy_classification", "TEXT"),
                 ("brier_loss", "REAL"),
+                ("evaluation_eligible", "INTEGER NOT NULL DEFAULT 1"),
+                ("probability_yes", "REAL"),
+                ("contract_spec_hash", "TEXT"),
             ]:
                 try:
                     conn.execute(f"ALTER TABLE feedback ADD COLUMN {col} {col_type}")
                 except Exception:
                     pass
+
+            # One settlement record per analysis.  Existing duplicates are left
+            # untouched; the endpoint also performs an explicit idempotency check.
+            try:
+                conn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_feedback_analysis_unique "
+                    "ON feedback(analysis_id)"
+                )
+            except sqlite3.IntegrityError:
+                logger.warning(
+                    "Could not create unique feedback index due to pre-existing duplicates",
+                    db_path=self.db_path,
+                )
+
+            # Additive forecast snapshot migration for existing databases.
+            for col, col_type in [
+                ("model_version", "TEXT"),
+                ("calibration_version", "TEXT"),
+                ("prompt_version", "TEXT"),
+                ("decision_policy_version", "TEXT"),
+                ("forecasted_at", "TEXT"),
+                ("forecast_cutoff_at", "TEXT"),
+                ("seconds_to_target", "REAL"),
+                ("target_definition", "TEXT"),
+                ("contract_spec", "TEXT"),
+                ("input_snapshot", "TEXT"),
+                ("feature_snapshot", "TEXT"),
+                ("model_components", "TEXT"),
+                ("data_quality", "TEXT"),
+                ("timing_provenance", "TEXT"),
+            ]:
+                try:
+                    conn.execute(f"ALTER TABLE forecasts ADD COLUMN {col} {col_type}")
+                except Exception:
+                    pass
+
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_forecasts_forecasted "
+                "ON forecasts(forecasted_at, forecast_id)"
+            )
         self._initialized = True
         logger.info("SQLite database initialized successfully", db_path=self.db_path)
 
@@ -367,8 +427,15 @@ class SQLiteStore:
                     probability_yes, probability_no, uncertainty_interval,
                     recommendation, decision_metrics, explanation,
                     evidence, specialist_context, image_description,
-                    market_data, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    market_data, model_version, calibration_version,
+                    prompt_version, decision_policy_version, forecasted_at,
+                    forecast_cutoff_at, seconds_to_target, target_definition,
+                    contract_spec, input_snapshot, feature_snapshot,
+                    model_components, data_quality, timing_provenance, created_at
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
                 ON CONFLICT(forecast_id) DO UPDATE SET
                     probability_yes = excluded.probability_yes,
                     probability_no = excluded.probability_no,
@@ -389,6 +456,24 @@ class SQLiteStore:
                     json.dumps(doc.get("specialist_context", {})),
                     doc.get("image_description"),
                     json.dumps(doc.get("market", {})),
+                    doc.get("model_version"),
+                    doc.get("calibration_version"),
+                    doc.get("prompt_version"),
+                    doc.get("decision_policy_version"),
+                    doc.get("forecasted_at"),
+                    doc.get("forecast_cutoff_at"),
+                    (
+                        float(doc["seconds_to_target"])
+                        if doc.get("seconds_to_target") is not None
+                        else None
+                    ),
+                    json.dumps(doc.get("target_definition", {})),
+                    json.dumps(doc.get("contract_spec", {})),
+                    json.dumps(doc.get("input_snapshot", {})),
+                    json.dumps(doc.get("feature_snapshot", {})),
+                    json.dumps(doc.get("model_components", {})),
+                    json.dumps(doc.get("data_quality", {})),
+                    json.dumps(doc.get("timing_provenance", {})),
                     doc["created_at"],
                 ),
             )
@@ -404,7 +489,21 @@ class SQLiteStore:
             if not row:
                 return None
             res = dict(row)
-            for f in ("uncertainty_interval", "decision_metrics", "explanation", "evidence", "specialist_context", "market_data"):
+            for f in (
+                "uncertainty_interval",
+                "decision_metrics",
+                "explanation",
+                "evidence",
+                "specialist_context",
+                "market_data",
+                "target_definition",
+                "contract_spec",
+                "input_snapshot",
+                "feature_snapshot",
+                "model_components",
+                "data_quality",
+                "timing_provenance",
+            ):
                 if res.get(f):
                     try:
                         res[f] = json.loads(res[f])
@@ -416,6 +515,126 @@ class SQLiteStore:
 
     async def get_forecast(self, forecast_id: str) -> dict[str, Any] | None:
         return await anyio.to_thread.run_sync(self._get_forecast_sync, forecast_id)
+
+    def _list_resolved_forecast_feedback_sync(
+        self,
+        *,
+        limit: int = 100,
+        category: str | None = None,
+        after_forecasted_at: str | None = None,
+        after_forecast_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return bounded, time-ordered forecast/feedback pairs.
+
+        Feedback is unique per analysis by index, but the subquery makes the
+        join deterministic even on databases created before that index existed.
+        """
+        if (after_forecasted_at is None) != (after_forecast_id is None):
+            raise ValueError(
+                "after_forecasted_at and after_forecast_id must be provided together"
+            )
+        bounded_limit = max(1, min(int(limit), 100))
+        conditions = [
+            "f.forecasted_at IS NOT NULL",
+            "fb.actual_outcome IS NOT NULL",
+        ]
+        params: list[Any] = []
+        if category:
+            conditions.append("LOWER(COALESCE(fb.category, '')) = ?")
+            params.append(category.lower())
+        if after_forecasted_at:
+            conditions.append(
+                "(f.forecasted_at > ? OR "
+                "(f.forecasted_at = ? AND f.forecast_id > ?))"
+            )
+            params.extend(
+                [after_forecasted_at, after_forecasted_at, after_forecast_id or ""]
+            )
+        params.append(bounded_limit)
+
+        query = f"""
+            SELECT
+                f.*,
+                fb.feedback_id AS fb_feedback_id,
+                fb.actual_outcome AS fb_actual_outcome,
+                fb.was_correct AS fb_was_correct,
+                fb.evaluation_eligible AS fb_evaluation_eligible,
+                fb.settled_price AS fb_settled_price,
+                fb.category AS fb_category,
+                fb.market_title AS fb_market_title,
+                fb.contract_spec_hash AS fb_contract_spec_hash,
+                fb.created_at AS fb_created_at
+            FROM forecasts f
+            JOIN feedback fb ON fb.rowid = (
+                SELECT rowid FROM feedback
+                WHERE analysis_id = f.analysis_id
+                ORDER BY created_at ASC
+                LIMIT 1
+            )
+            WHERE {' AND '.join(conditions)}
+            ORDER BY f.forecasted_at ASC, f.forecast_id ASC
+            LIMIT ?
+        """
+
+        with self._get_connection() as conn:
+            cursor = conn.execute(query, params)
+            pairs: list[dict[str, Any]] = []
+            for row in cursor.fetchall():
+                record = dict(row)
+                feedback = {
+                    "feedback_id": record.pop("fb_feedback_id"),
+                    "actual_outcome": record.pop("fb_actual_outcome"),
+                    "was_correct": bool(record.pop("fb_was_correct")),
+                    "evaluation_eligible": bool(
+                        record.pop("fb_evaluation_eligible")
+                    ),
+                    "settled_price": record.pop("fb_settled_price"),
+                    "category": record.pop("fb_category"),
+                    "market_title": record.pop("fb_market_title"),
+                    "contract_spec_hash": record.pop("fb_contract_spec_hash"),
+                    "created_at": record.pop("fb_created_at"),
+                }
+                for field in (
+                    "uncertainty_interval",
+                    "decision_metrics",
+                    "explanation",
+                    "evidence",
+                    "specialist_context",
+                    "market_data",
+                    "target_definition",
+                    "contract_spec",
+                    "input_snapshot",
+                    "feature_snapshot",
+                    "model_components",
+                    "data_quality",
+                    "timing_provenance",
+                ):
+                    if record.get(field):
+                        try:
+                            record[field] = json.loads(record[field])
+                        except (TypeError, json.JSONDecodeError):
+                            pass
+                if record.get("market_data"):
+                    record["market"] = record["market_data"]
+                pairs.append({"forecast": record, "feedback": feedback})
+            return pairs
+
+    async def list_resolved_forecast_feedback(
+        self,
+        *,
+        limit: int = 100,
+        category: str | None = None,
+        after_forecasted_at: str | None = None,
+        after_forecast_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        return await anyio.to_thread.run_sync(
+            lambda: self._list_resolved_forecast_feedback_sync(
+                limit=limit,
+                category=category,
+                after_forecasted_at=after_forecasted_at,
+                after_forecast_id=after_forecast_id,
+            )
+        )
 
     # ------------------------------------------------------------------
     # Feedback & Continuous Learning Loop
@@ -431,10 +650,11 @@ class SQLiteStore:
                 """
                 INSERT INTO feedback (
                     feedback_id, analysis_id, user_id, category, market_title,
-                    recommendation, actual_outcome, was_correct, settled_price,
+                    recommendation, actual_outcome, was_correct, evaluation_eligible,
+                    probability_yes, contract_spec_hash, settled_price,
                     user_notes, postmortem_analysis, key_learnings,
                     visual_observations, discrepancy_classification, brier_loss, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     feedback_id,
@@ -445,13 +665,20 @@ class SQLiteStore:
                     doc.get("recommendation"),
                     str(doc.get("actual_outcome")),
                     1 if doc.get("was_correct") else 0,
-                    float(doc.get("settled_price")) if doc.get("settled_price") is not None else None,
+                    1 if doc.get("evaluation_eligible", True) else 0,
+                    (
+                        float(str(doc["probability_yes"]))
+                        if doc.get("probability_yes") is not None
+                        else None
+                    ),
+                    doc.get("contract_spec_hash"),
+                    float(str(doc.get("settled_price"))) if doc.get("settled_price") is not None else None,
                     doc.get("user_notes"),
                     doc.get("postmortem_analysis"),
                     json.dumps(doc.get("key_learnings", [])),
                     doc.get("visual_observations"),
                     doc.get("discrepancy_classification"),
-                    float(doc.get("brier_loss")) if doc.get("brier_loss") is not None else None,
+                    float(str(doc.get("brier_loss"))) if doc.get("brier_loss") is not None else None,
                     doc["created_at"],
                 ),
             )
@@ -459,6 +686,28 @@ class SQLiteStore:
 
     async def record_feedback(self, doc: dict[str, Any]) -> dict[str, Any]:
         return await anyio.to_thread.run_sync(self._record_feedback_sync, doc)
+
+    def _get_feedback_by_analysis_sync(self, analysis_id: str) -> dict[str, Any] | None:
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                "SELECT * FROM feedback WHERE analysis_id = ? ORDER BY created_at ASC LIMIT 1",
+                (analysis_id,),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            result = dict(row)
+            result["was_correct"] = bool(result.get("was_correct"))
+            result["evaluation_eligible"] = bool(result.get("evaluation_eligible", True))
+            if result.get("key_learnings"):
+                try:
+                    result["key_learnings"] = json.loads(result["key_learnings"])
+                except Exception:
+                    pass
+            return result
+
+    async def get_feedback_by_analysis(self, analysis_id: str) -> dict[str, Any] | None:
+        return await anyio.to_thread.run_sync(self._get_feedback_by_analysis_sync, analysis_id)
 
     def _get_recent_learnings_sync(self, category: str | None = None, limit: int = 5) -> list[dict[str, Any]]:
         with self._get_connection() as conn:
@@ -476,6 +725,7 @@ class SQLiteStore:
             for r in cursor.fetchall():
                 d = dict(r)
                 d["was_correct"] = bool(d["was_correct"])
+                d["evaluation_eligible"] = bool(d.get("evaluation_eligible", True))
                 if d.get("key_learnings"):
                     try:
                         d["key_learnings"] = json.loads(d["key_learnings"])

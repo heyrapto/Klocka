@@ -112,6 +112,37 @@ def classify_interval_phase(seconds_remaining: float, total_duration: float = 90
     return "CAPITAL_ACCUMULATION"
 
 
+def align_interval_boundary(dt: datetime, tolerance_seconds: float = 90.0) -> datetime:
+    """Snap an interval resolution timestamp to the exact 5m/15m candle boundary.
+
+    Interval crypto markets (15m, 5m, 1h) resolve on clean clock boundaries
+    (:00, :05, :10, :15, :20, :25, :30, :35, :40, :45, :50, :55). Screenshot
+    upload delay or platform oracle latency offsets (e.g. Bayse's +60s resolutionDate
+    or 14:59.999 closes_at) can place the raw timestamp 30-90 seconds away from
+    the true candle close.
+    """
+    if dt.microsecond >= 500_000:
+        dt = (dt + timedelta(seconds=1)).replace(microsecond=0)
+    else:
+        dt = dt.replace(microsecond=0)
+
+    seconds_in_hour = dt.minute * 60 + dt.second
+
+    # Priority 1: Check 15-minute boundaries (:00, :15, :30, :45)
+    for target in (0, 900, 1800, 2700, 3600):
+        if abs(seconds_in_hour - target) <= tolerance_seconds:
+            base_hour = dt.replace(minute=0, second=0)
+            return base_hour + timedelta(seconds=target)
+
+    # Priority 2: Check 5-minute boundaries (every 300s)
+    for target in range(0, 3900, 300):
+        if abs(seconds_in_hour - target) <= min(tolerance_seconds, 60.0):
+            base_hour = dt.replace(minute=0, second=0)
+            return base_hour + timedelta(seconds=target)
+
+    return dt
+
+
 def resolve_market_timing(
     workflow_started_at: datetime,
     countdown_text: str | None = None,
@@ -136,20 +167,21 @@ def resolve_market_timing(
 
     # Priority 1: If countdown was explicitly visible in screenshot, anchor to workflow_started_at
     if parsed_countdown is not None and parsed_countdown > 0:
-        exact_resolves_at = workflow_started_at + timedelta(seconds=parsed_countdown)
-        initial_seconds = parsed_countdown
+        raw_resolves_at = workflow_started_at + timedelta(seconds=parsed_countdown)
+        exact_resolves_at = align_interval_boundary(raw_resolves_at, tolerance_seconds=90.0)
+        initial_seconds = max(0.0, (exact_resolves_at - workflow_started_at).total_seconds())
     # Priority 2: Verified platform API closes_at
     elif market_closes_at is not None:
-        exact_resolves_at = market_closes_at
-        initial_seconds = max(0.0, (market_closes_at - workflow_started_at).total_seconds())
+        exact_resolves_at = align_interval_boundary(market_closes_at, tolerance_seconds=90.0)
+        initial_seconds = max(0.0, (exact_resolves_at - workflow_started_at).total_seconds())
     # Priority 3: Displayed OCR expiry date
     elif displayed_expiry is not None:
-        exact_resolves_at = displayed_expiry
-        initial_seconds = max(0.0, (displayed_expiry - workflow_started_at).total_seconds())
+        exact_resolves_at = align_interval_boundary(displayed_expiry, tolerance_seconds=90.0)
+        initial_seconds = max(0.0, (exact_resolves_at - workflow_started_at).total_seconds())
     # Default fallback: 15-minute interval from start time
     else:
         initial_seconds = 900.0
-        exact_resolves_at = workflow_started_at + timedelta(seconds=900.0)
+        exact_resolves_at = align_interval_boundary(workflow_started_at + timedelta(seconds=900.0), tolerance_seconds=90.0)
 
     # Compute remaining time at this exact decision moment
     remaining = max(0.0, (exact_resolves_at - now).total_seconds())

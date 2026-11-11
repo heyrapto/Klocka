@@ -21,17 +21,26 @@ class DecisionMetrics(BaseModel):
     minimum_required_edge: Decimal
     spread: Decimal
     slippage_bps: int = Field(ge=0)
+    # Historical field name retained for API compatibility.  It holds the
+    # fractional-Kelly stake actually used for the recommended side.
     quarter_kelly_fraction: Decimal = Field(ge=Decimal("0.0"), le=Decimal("1.0"))
-    taker_fee_rate_yes: Decimal = Field(default=Decimal("0.05"), ge=Decimal("0.0"))
-    taker_fee_rate_no: Decimal = Field(default=Decimal("0.05"), ge=Decimal("0.0"))
-    depth_ask_usd_yes: Decimal = Field(default=Decimal("1000.0"), ge=Decimal("0.0"))
-    depth_ask_usd_no: Decimal = Field(default=Decimal("1000.0"), ge=Decimal("0.0"))
-    target_order_usd: Decimal = Field(default=Decimal("100.0"))
+    kelly_fraction_yes: Decimal = Field(default=Decimal("0.0"), ge=Decimal("0.0"), le=Decimal("1.0"))
+    kelly_fraction_no: Decimal = Field(default=Decimal("0.0"), ge=Decimal("0.0"), le=Decimal("1.0"))
+    kelly_fraction_used: Decimal = Field(default=Decimal("0.0"), ge=Decimal("0.0"), le=Decimal("1.0"))
+    taker_fee_rate_yes: Decimal = Field(default=Decimal("0.01"), ge=Decimal("0.0"))
+    taker_fee_rate_no: Decimal = Field(default=Decimal("0.01"), ge=Decimal("0.0"))
+    depth_ask_usd_yes: Decimal | None = Field(default=None, ge=Decimal("0.0"))
+    depth_ask_usd_no: Decimal | None = Field(default=None, ge=Decimal("0.0"))
+    target_order_usd: Decimal = Field(default=Decimal("100.0"), gt=Decimal("0.0"))
+    minimum_depth_usd: Decimal = Field(default=Decimal("100.0"), gt=Decimal("0.0"))
     fill_complete_yes: bool = True
     fill_complete_no: bool = True
     depth_known: bool = True
     quote_age_seconds: Decimal | None = None
+    max_quote_age_seconds: Decimal = Field(default=Decimal("15.0"), gt=Decimal("0.0"))
     fee_model: str = "variance"
+    resolution_risk_flags: list[str] = Field(default_factory=list)
+    blocking_resolution_flags: list[str] = Field(default_factory=list)
 
 
 class DecisionEvaluation(BaseModel):

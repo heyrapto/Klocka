@@ -1,4 +1,5 @@
 import asyncio
+import sqlite3
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -18,6 +19,7 @@ from fastapi import (
     status,
 )
 from fastapi.responses import StreamingResponse
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -51,6 +53,56 @@ from prediction_ai.vision.images import validate_and_normalize_image
 logger = structlog.get_logger(__name__)
 
 router = APIRouter(prefix="/analyses", tags=["Analyses"])
+
+_ALLOWED_SETTLEMENT_OUTCOMES = frozenset(
+    {"YES", "NO", "UP", "DOWN", "HIGHER", "LOWER", "BUY UP", "BUY DOWN"}
+)
+
+
+def _normalize_settlement_outcome(value: str) -> str:
+    normalized = value.strip().upper().replace("_", " ")
+    if normalized not in _ALLOWED_SETTLEMENT_OUTCOMES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "actual_outcome must be one of YES, NO, UP, DOWN, HIGHER, LOWER, "
+                "BUY UP, or BUY DOWN."
+            ),
+        )
+    return normalized
+
+
+def _ensure_analysis_access(doc: dict[str, Any], user_id: UUID) -> None:
+    owner = doc.get("user_id")
+    if owner and str(owner) != str(user_id):
+        # Do not reveal whether another user's analysis exists.
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Analysis not found")
+
+
+def _feedback_response_from_doc(doc: dict[str, Any]) -> AnalysisFeedbackResponse:
+    recommendation = str(doc.get("recommendation") or "NO_TRADE")
+    probability_yes = doc.get("probability_yes")
+    if probability_yes is None:
+        prediction_made = recommendation
+    else:
+        prediction_made = f"{recommendation} (P(YES)={float(probability_yes):.2f})"
+    return AnalysisFeedbackResponse(
+        feedback_id=UUID(str(doc["feedback_id"])),
+        analysis_id=UUID(str(doc["analysis_id"])),
+        actual_outcome=str(doc.get("actual_outcome") or ""),
+        was_correct=bool(doc.get("was_correct")),
+        evaluation_eligible=bool(doc.get("evaluation_eligible", True)),
+        prediction_made=prediction_made,
+        postmortem_analysis=str(doc.get("postmortem_analysis") or ""),
+        visual_observations=doc.get("visual_observations"),
+        discrepancy_classification=doc.get("discrepancy_classification"),
+        key_learnings=list(doc.get("key_learnings") or []),
+        created_at=(
+            datetime.fromisoformat(str(doc["created_at"]))
+            if doc.get("created_at")
+            else datetime.now(UTC)
+        ),
+    )
 
 
 async def _ensure_profile_exists(session: AsyncSession, user_id: UUID) -> None:
@@ -121,7 +173,7 @@ async def create_analysis(
     analysis_id = uuid4()
     now_dt = datetime.now(UTC)
 
-    analysis_record = {
+    analysis_record: dict[str, Any] = {
         "analysis_id": str(analysis_id),
         "user_id": str(current_user.id),
         "status": "RECEIVED",
@@ -316,6 +368,7 @@ async def get_analysis_status(
                 prompt_version=forecast_data.get("prompt_version", "v1"),
                 decision_policy_version=forecast_data.get("decision_policy_version", "v1"),
                 explanation=forecast_data.get("explanation", {}),
+                timing_provenance=forecast_data.get("timing_provenance"),
             )
 
         error_info: AnalysisErrorInfo | None = None
@@ -551,6 +604,7 @@ async def submit_analysis_feedback(
     doc = await sqlite.get_analysis(str(analysis_id))
     if doc is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Analysis not found")
+    _ensure_analysis_access(doc, current_user.id)
 
     content_type = request.headers.get("content-type", "")
     settlement_file_bytes: bytes | None = None
@@ -568,10 +622,36 @@ async def submit_analysis_feedback(
             settlement_file_mime = getattr(file_field, "content_type", "image/jpeg") or "image/jpeg"
     else:
         body = await request.json()
-        payload = AnalysisFeedbackRequest.model_validate(body)
+        try:
+            payload = AnalysisFeedbackRequest.model_validate(body)
+        except ValidationError as error:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=error.errors(),
+            ) from error
         actual_outcome = payload.actual_outcome
         settled_price = payload.settled_price
         notes = payload.notes
+
+    actual_outcome = _normalize_settlement_outcome(actual_outcome)
+    if settled_price is not None and not (Decimal("0") <= settled_price <= Decimal("1")):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="settled_price must be between 0 and 1.",
+        )
+
+    existing = await sqlite.get_feedback_by_analysis(str(analysis_id))
+    if existing is not None:
+        existing_outcome = _normalize_settlement_outcome(str(existing.get("actual_outcome", "")))
+        if existing_outcome != actual_outcome:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "Settlement feedback already exists for this analysis with a "
+                    f"different outcome ({existing_outcome})."
+                ),
+            )
+        return _feedback_response_from_doc(existing)
 
     forecast_doc = doc.get("forecast") or {}
     recommendation = forecast_doc.get("recommendation", "NO_TRADE")
@@ -587,7 +667,7 @@ async def submit_analysis_feedback(
 
     specialist_context = doc.get("specialist_context") or forecast_doc.get("specialist_context")
     extraction_res = doc.get("extraction_result") or {}
-    strike_price = float(extraction_res.get("target_price")) if extraction_res.get("target_price") else None
+    strike_price = float(str(extraction_res.get("target_price"))) if extraction_res.get("target_price") else None
 
     postmortem = await run_postmortem_analysis(
         market_title=market_title,
@@ -606,24 +686,13 @@ async def submit_analysis_feedback(
     )
 
     was_correct = postmortem.was_correct
+    evaluation_eligible = postmortem.evaluation_eligible
     postmortem_analysis = postmortem.postmortem_analysis
     key_learnings = postmortem.key_learnings
 
-    # Recalibrate persistent SQLite Knowledge Matrix for this asset
-    await sqlite.update_asset_calibration(
-        symbol=symbol,
-        category=category,
-        was_correct=was_correct,
-        brier_loss=postmortem.brier_loss,
-        vol_multiplier_delta=postmortem.vol_multiplier_delta,
-        momentum_weight_delta=postmortem.momentum_weight_delta,
-        order_flow_weight_delta=postmortem.order_flow_weight_delta,
-        uncertainty_margin_delta=postmortem.uncertainty_margin_delta,
-        reason=postmortem.discrepancy_classification,
-    )
-
     feedback_id = uuid4()
     now_dt = datetime.now(UTC)
+    contract_spec = forecast_doc.get("contract_spec") or {}
     feedback_doc = {
         "id": str(feedback_id),
         "feedback_id": str(feedback_id),
@@ -634,6 +703,9 @@ async def submit_analysis_feedback(
         "recommendation": recommendation,
         "actual_outcome": actual_outcome,
         "was_correct": was_correct,
+        "evaluation_eligible": evaluation_eligible,
+        "probability_yes": prob_yes,
+        "contract_spec_hash": contract_spec.get("spec_hash"),
         "settled_price": float(settled_price) if settled_price is not None else None,
         "user_notes": notes,
         "postmortem_analysis": postmortem_analysis,
@@ -644,12 +716,34 @@ async def submit_analysis_feedback(
         "has_settlement_screenshot": bool(settlement_file_bytes),
         "created_at": now_dt.isoformat(),
     }
-    await sqlite.record_feedback(feedback_doc)
+    try:
+        await sqlite.record_feedback(feedback_doc)
+    except sqlite3.IntegrityError:
+        existing = await sqlite.get_feedback_by_analysis(str(analysis_id))
+        if existing is not None:
+            return _feedback_response_from_doc(existing)
+        raise
+
+    # Only update decision/calibration parameters when a recommendation was
+    # actually made.  An abstention is not evidence for or against a trade.
+    if evaluation_eligible:
+        await sqlite.update_asset_calibration(
+            symbol=symbol,
+            category=category,
+            was_correct=was_correct,
+            brier_loss=postmortem.brier_loss,
+            vol_multiplier_delta=postmortem.vol_multiplier_delta,
+            momentum_weight_delta=postmortem.momentum_weight_delta,
+            order_flow_weight_delta=postmortem.order_flow_weight_delta,
+            uncertainty_margin_delta=postmortem.uncertainty_margin_delta,
+            reason=postmortem.discrepancy_classification,
+        )
 
     logger.info(
         "Recorded postmortem feedback for continuous learning",
         analysis_id=str(analysis_id),
         was_correct=was_correct,
+        evaluation_eligible=evaluation_eligible,
         recommendation=recommendation,
         actual_outcome=actual_outcome,
         has_screenshot=bool(settlement_file_bytes),
@@ -660,6 +754,7 @@ async def submit_analysis_feedback(
         analysis_id=analysis_id,
         actual_outcome=actual_outcome,
         was_correct=was_correct,
+        evaluation_eligible=evaluation_eligible,
         prediction_made=prediction_made,
         postmortem_analysis=postmortem_analysis,
         visual_observations=postmortem.visual_observations,
@@ -684,6 +779,13 @@ async def auto_settle_analysis(
     doc = await sqlite.get_analysis(str(analysis_id))
     if doc is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Analysis not found")
+    _ensure_analysis_access(doc, current_user.id)
+
+    existing = await sqlite.get_feedback_by_analysis(str(analysis_id))
+    if existing is not None:
+        # Auto-settlement is idempotent: a retry must not fetch a new price,
+        # re-run the postmortem, or double-count calibration.
+        return _feedback_response_from_doc(existing)
 
     forecast_doc = doc.get("forecast") or {}
     recommendation = forecast_doc.get("recommendation", "NO_TRADE")
@@ -721,6 +823,21 @@ async def auto_settle_analysis(
         except Exception:
             pass
 
+    if resolves_at_dt is not None:
+        if resolves_at_dt.tzinfo is None:
+            resolves_at_dt = resolves_at_dt.replace(tzinfo=UTC)
+        if resolves_at_dt > datetime.now(UTC):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "Cannot auto-settle before the contract resolves. "
+                    f"Detected resolution time is {resolves_at_dt.isoformat()}. "
+                    "Wait for the candle to close, then retry. If the contract has "
+                    "already resolved but no countdown was detected, use the manual "
+                    "settlement form below."
+                ),
+            )
+
     from prediction_ai.specialists.crypto.settlement import (
         determine_binary_outcome,
         fetch_crypto_settlement_price,
@@ -730,7 +847,12 @@ async def auto_settle_analysis(
     if settled_price is None:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Could not retrieve live spot price for {symbol} to auto-settle",
+            detail=(
+                f"Could not retrieve a verified {symbol} spot price from the multi-venue "
+                "exchange mesh (Binance, Coinbase, Kraken, OKX, Bybit, MEXC, Gate.io, "
+                "Bitstamp, CoinGecko, DefiLlama). Those venues may be blocked on this "
+                "network. You can still report the settlement manually below."
+            ),
         )
 
     label_positive = "YES"
@@ -755,7 +877,10 @@ async def auto_settle_analysis(
 
     from prediction_ai.learning.postmortem_agent import run_postmortem_analysis
 
-    notes = f"Auto-settled via live ticker feed: {symbol} spot at ${settled_price:,.2f} vs strike ${strike_price:,.2f} ({direction})."
+    notes = (
+        f"Auto-settled via verified exchange mesh: {symbol} spot at "
+        f"${settled_price:,.2f} vs strike ${strike_price:,.2f} ({direction})."
+    )
 
     postmortem = await run_postmortem_analysis(
         market_title=market_title,
@@ -772,23 +897,13 @@ async def auto_settle_analysis(
     )
 
     was_correct = postmortem.was_correct
+    evaluation_eligible = postmortem.evaluation_eligible
     postmortem_analysis = postmortem.postmortem_analysis
     key_learnings = postmortem.key_learnings
 
-    await sqlite.update_asset_calibration(
-        symbol=symbol,
-        category=category,
-        was_correct=was_correct,
-        brier_loss=postmortem.brier_loss,
-        vol_multiplier_delta=postmortem.vol_multiplier_delta,
-        momentum_weight_delta=postmortem.momentum_weight_delta,
-        order_flow_weight_delta=postmortem.order_flow_weight_delta,
-        uncertainty_margin_delta=postmortem.uncertainty_margin_delta,
-        reason=postmortem.discrepancy_classification,
-    )
-
     feedback_id = uuid4()
     now_dt = datetime.now(UTC)
+    contract_spec = forecast_doc.get("contract_spec") or {}
     feedback_doc = {
         "id": str(feedback_id),
         "feedback_id": str(feedback_id),
@@ -799,6 +914,9 @@ async def auto_settle_analysis(
         "recommendation": recommendation,
         "actual_outcome": actual_outcome,
         "was_correct": was_correct,
+        "evaluation_eligible": evaluation_eligible,
+        "probability_yes": prob_yes,
+        "contract_spec_hash": contract_spec.get("spec_hash"),
         "settled_price": settled_price,
         "user_notes": notes,
         "postmortem_analysis": postmortem_analysis,
@@ -809,7 +927,26 @@ async def auto_settle_analysis(
         "has_settlement_screenshot": False,
         "created_at": now_dt.isoformat(),
     }
-    await sqlite.record_feedback(feedback_doc)
+    try:
+        await sqlite.record_feedback(feedback_doc)
+    except sqlite3.IntegrityError:
+        existing = await sqlite.get_feedback_by_analysis(str(analysis_id))
+        if existing is not None:
+            return _feedback_response_from_doc(existing)
+        raise
+
+    if evaluation_eligible:
+        await sqlite.update_asset_calibration(
+            symbol=symbol,
+            category=category,
+            was_correct=was_correct,
+            brier_loss=postmortem.brier_loss,
+            vol_multiplier_delta=postmortem.vol_multiplier_delta,
+            momentum_weight_delta=postmortem.momentum_weight_delta,
+            order_flow_weight_delta=postmortem.order_flow_weight_delta,
+            uncertainty_margin_delta=postmortem.uncertainty_margin_delta,
+            reason=postmortem.discrepancy_classification,
+        )
 
     logger.info(
         "Auto-settled analysis successfully",
@@ -818,6 +955,7 @@ async def auto_settle_analysis(
         strike_price=strike_price,
         actual_outcome=actual_outcome,
         was_correct=was_correct,
+        evaluation_eligible=evaluation_eligible,
     )
 
     return AnalysisFeedbackResponse(
@@ -825,6 +963,7 @@ async def auto_settle_analysis(
         analysis_id=analysis_id,
         actual_outcome=actual_outcome,
         was_correct=was_correct,
+        evaluation_eligible=evaluation_eligible,
         prediction_made=prediction_made,
         postmortem_analysis=postmortem_analysis,
         visual_observations=None,

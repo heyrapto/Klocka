@@ -1,9 +1,11 @@
 from datetime import datetime
 from decimal import Decimal
+from typing import Any
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from prediction_ai.schemas.contract import ContractSpec
 from prediction_ai.schemas.decision import DecisionMetrics, RecommendationType
 from prediction_ai.schemas.market import NormalizedOutcome
 
@@ -77,11 +79,19 @@ class ForecastSummary(BaseModel):
     prompt_version: str
     decision_policy_version: str
     explanation: dict
+    timing_provenance: dict[str, Any] | None = None
 
 
 class ForecastResponse(ForecastSummary):
-    """Full immutable forecast snapshot."""
+    """Full immutable forecast snapshot.
+
+    Snapshot fields are additive and optional so forecasts written before the
+    contract-aware pipeline remain readable.
+    """
 
     calibration_version: str | None = None
     evidence: list[EvidenceItem] = Field(default_factory=list)
     input_snapshot: dict = Field(default_factory=dict)
+    contract_spec: ContractSpec | None = None
+    feature_snapshot: dict = Field(default_factory=dict)
+    model_components: dict = Field(default_factory=dict)

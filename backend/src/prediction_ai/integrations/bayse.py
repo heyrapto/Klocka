@@ -1,6 +1,6 @@
 import re
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -378,6 +378,22 @@ class BayseAdapter:
         rules = raw.get("rules")
         closes_at = _parse_datetime(event.get("closingDate"))
         resolves_at = _parse_datetime(event.get("resolutionDate")) or closes_at
+
+        # Bayse interval market timestamp normalization:
+        # Closing dates on Bayse are stored as the last millisecond of the interval
+        # (e.g. 09:14:59.999000Z for a 15-minute interval ending at 09:15:00Z).
+        # Snap closingDate ending at :59.999 or :59 to the clean interval second boundary.
+        if closes_at is not None:
+            if closes_at.microsecond >= 900_000:
+                closes_at = (closes_at + timedelta(milliseconds=1000 - (closes_at.microsecond // 1000))).replace(microsecond=0)
+            elif closes_at.second == 59 and closes_at.microsecond == 0:
+                closes_at = closes_at + timedelta(seconds=1)
+
+            # Bayse resolutionDate is set 60s after the interval candle closes
+            # (e.g. 09:16:00Z vs 09:15:00Z) to allow the Chainlink TWAP oracle buffer.
+            # The trade countdown and contract resolution correspond to candle close (closes_at).
+            if resolves_at is not None and 30 <= (resolves_at - closes_at).total_seconds() <= 120:
+                resolves_at = closes_at
 
         return NormalizedMarket(
             platform="bayse",

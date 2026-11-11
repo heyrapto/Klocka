@@ -97,6 +97,17 @@ def test_baseline_forecaster_imbalance():
     assert result.probability_yes + result.probability_no == Decimal("1.00")
 
 
+def test_baseline_forecaster_refuses_missing_market_quote():
+    market, order_book = _make_test_market_and_book()
+    order_book.quotes[0].mid_price = None
+    order_book.quotes[0].best_bid = None
+    order_book.quotes[0].best_ask = None
+    forecaster = BaselineForecaster()
+
+    with pytest.raises(ValueError, match="no 0.50 substitute"):
+        forecaster.forecast(market, order_book)
+
+
 @pytest.mark.asyncio
 async def test_gemini_forecaster_no_key_strictly_fails():
     from prediction_ai.core.config import Settings

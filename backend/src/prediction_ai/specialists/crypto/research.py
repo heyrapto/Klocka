@@ -1,9 +1,28 @@
 """Crypto specialist research service with resilient multi-venue fallbacks.
 
-Gathers real-time market data across a cascade of premier crypto exchanges
-(Binance Global, Binance US, OKX, Bybit, Coinbase, Kraken, CoinGecko) and gracefully
-anchors to screenshot point-in-time spot prices if live venue APIs are unreachable.
-Computes mathematically grounded probabilities via log-normal digital option math.
+Gathers live market data from a mesh of official public exchange and aggregator
+APIs, validates the result across venues, and computes a mathematically grounded
+probability via log-normal digital option pricing.
+
+Data-gathering strategy
+-----------------------
+Every data group (spot, 15m candles, 1h candles, order book, derivatives, fear
+and greed) runs concurrently.  Within each group the venues are also raced
+concurrently.  A full-outage therefore costs roughly one group budget rather
+than one timeout per venue in a sequential waterfall.
+
+Spot resolution order
+---------------------
+1. Cross-venue live spot mesh (short settle window + median + outlier rejection).
+2. Most recent closed 15m candle close.
+3. Most recent closed 1h candle close.
+4. Screenshot point-in-time spot extracted by vision.
+5. ``DATA_UNAVAILABLE`` (never a fabricated price).
+
+The live path uses official public REST APIs.  Exchange websites are not
+scraped: their front-ends are JavaScript applications protected by bot
+management, their DOM changes without notice, and the same data is already
+published through documented public API programmes.
 """
 
 from __future__ import annotations
@@ -16,35 +35,32 @@ from typing import Any
 import httpx
 import structlog
 
+from prediction_ai.core.config import Settings, get_settings
+from prediction_ai.integrations.network import build_resilient_client
 from prediction_ai.specialists.crypto.features import (
-    CryptoMarketFeatures,
-    analyze_order_book,
     build_features,
     interpret_funding_rate,
-    prob_above_strike,
     realized_vol_annualized,
+)
+from prediction_ai.specialists.crypto.venues import (
+    BookSnapshot,
+    DerivativesSnapshot,
+    FearGreedSnapshot,
+    OhlcvSnapshot,
+    SpotSnapshot,
+    fetch_derivatives_snapshot,
+    fetch_fear_and_greed,
+    fetch_ohlcv_snapshot,
+    fetch_order_book_snapshot,
+    fetch_spot_snapshot,
 )
 
 logger = structlog.get_logger(__name__)
 
 # ---------------------------------------------------------------------------
-# Public exchange API endpoints (no auth required)
+# Symbol maps
 # ---------------------------------------------------------------------------
 
-_BINANCE_SPOT = "https://api.binance.com"
-_BINANCE_FUTURES = "https://fapi.binance.com"
-_BINANCE_US = "https://api.binance.us"
-_OKX = "https://www.okx.com"
-_BYBIT = "https://api.bybit.com"
-_COINBASE_API = "https://api.coinbase.com"
-_COINBASE_EXCHANGE = "https://api.exchange.coinbase.com"
-_KRAKEN = "https://api.kraken.com"
-_COINGECKO = "https://api.coingecko.com"
-_FEAR_GREED = "https://api.alternative.me/fng"
-
-_TIMEOUT = httpx.Timeout(6.0, connect=3.0)
-
-# Map common names to standardized ticker symbols
 _SYMBOL_MAP: dict[str, str] = {
     "btc": "BTC", "bitcoin": "BTC",
     "eth": "ETH", "ethereum": "ETH",
@@ -65,32 +81,6 @@ _SYMBOL_MAP: dict[str, str] = {
     "pepe": "PEPE",
 }
 
-_COINGECKO_MAP: dict[str, str] = {
-    "BTC": "bitcoin",
-    "ETH": "ethereum",
-    "SOL": "solana",
-    "XRP": "ripple",
-    "BNB": "binancecoin",
-    "DOGE": "dogecoin",
-    "ADA": "cardano",
-    "AVAX": "avalanche-2",
-    "MATIC": "polygon-ecosystem-token",
-    "LINK": "chainlink",
-    "NEAR": "near",
-    "SUI": "sui",
-}
-
-_KRAKEN_PAIR_MAP: dict[str, str] = {
-    "BTC": "XBTUSD",
-    "ETH": "ETHUSD",
-    "SOL": "SOLUSD",
-    "XRP": "XRPUSD",
-    "DOGE": "XDGUSD",
-    "ADA": "ADAUSD",
-    "AVAX": "AVAXUSD",
-    "LINK": "LINKUSD",
-}
-
 _ASSET_BASE_VOL: dict[str, float] = {
     "BTC": 0.55,
     "ETH": 0.65,
@@ -102,6 +92,14 @@ _ASSET_BASE_VOL: dict[str, float] = {
     "SUI": 1.05,
 }
 
+_SPOT_DISPERSION_WARNING_BPS = 50.0
+_ORDER_BOOK_MAX_DEVIATION = 0.02
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
 
 def _infer_symbol(title: str, hint: str | None = None) -> str:
     """Extract the most likely trading symbol from a market title."""
@@ -110,24 +108,26 @@ def _infer_symbol(title: str, hint: str | None = None) -> str:
         if keyword in text:
             return sym
     match = re.search(r"\b([A-Z]{2,6})\b(?:/USD|USDT|USD)?", title)
-    if match and match.group(1) in {v for v in _SYMBOL_MAP.values()}:
+    if match and match.group(1) in set(_SYMBOL_MAP.values()):
         return match.group(1)
     return "BTC"
 
 
 def _parse_strike_and_direction(title: str) -> tuple[float | None, str]:
-    """
-    Extract the strike price and comparison direction from a market title.
+    """Extract the strike price and comparison direction from a market title.
 
-    Returns:
-        (strike_price, direction) where direction is "above", "below", or "unknown"
+    Returns ``(strike_price, direction)`` where direction is ``"above"``,
+    ``"below"``, or ``"unknown"``.
     """
     title_norm = title.replace(",", "").replace("$", "").lower()
 
     direction = "above"
     if any(w in title_norm for w in ["below", "less than", "under", "sub-", "drop to", "down"]):
         direction = "below"
-    elif any(w in title_norm for w in ["above", "greater than", "over", "reach", "hit", "surpass", "up"]):
+    elif any(
+        w in title_norm
+        for w in ["above", "greater than", "over", "reach", "hit", "surpass", "up"]
+    ):
         direction = "above"
 
     patterns = [
@@ -138,329 +138,278 @@ def _parse_strike_and_direction(title: str) -> tuple[float | None, str]:
     ]
 
     for pat in patterns:
-        m = re.search(pat, title_norm)
-        if m:
-            val_str = m.group(1)
-            try:
-                val = float(val_str)
-                if "k" in pat:
-                    val *= 1000.0
-                if val > 0:
-                    return val, direction
-            except ValueError:
-                continue
+        match = re.search(pat, title_norm)
+        if not match:
+            continue
+        try:
+            value = float(match.group(1))
+        except ValueError:
+            continue
+        if "k" in pat:
+            value *= 1000.0
+        if value > 0:
+            return value, direction
 
     return None, direction
 
 
-def _format_error(e: Exception) -> str:
-    err_str = str(e).strip()
-    return f"{type(e).__name__}: {err_str}" if err_str else type(e).__name__
-
-
-async def _safe_get(
-    client: httpx.AsyncClient,
-    url: str,
-    params: dict | None = None,
-    label: str = "",
-) -> dict | list | None:
-    """GET with error swallowing and descriptive logging."""
+async def _load_vol_multiplier(symbol: str) -> float:
+    """Load the learned volatility calibration, defaulting to 1.0."""
     try:
-        resp = await client.get(url, params=params, timeout=_TIMEOUT)
-        if resp.status_code == 200:
-            return resp.json()
+        from prediction_ai.db.sqlite import get_sqlite_db  # noqa: PLC0415
+
+        sqlite = get_sqlite_db()
+        calibration = await sqlite.get_asset_calibration(symbol)
+        value = float(calibration.get("vol_multiplier", 1.0))
+        if 0.25 <= value <= 4.0:
+            return value
         logger.warning(
-            "Crypto data fetch returned non-200",
-            url=url,
-            status=resp.status_code,
-            label=label,
+            "Ignoring out-of-range volatility calibration",
+            symbol=symbol,
+            vol_multiplier=value,
         )
-    except Exception as e:
+    except Exception as exc:  # noqa: BLE001 - calibration is optional
         logger.warning(
-            "Crypto data fetch failed",
-            url=url,
-            label=label,
-            error=_format_error(e),
+            "Could not load asset volatility calibration",
+            symbol=symbol,
+            error=type(exc).__name__,
+            error_detail=str(exc) or None,
         )
-    return None
+    return 1.0
 
 
-# ---------------------------------------------------------------------------
-# Multi-Venue Resilient Fetchers
-# ---------------------------------------------------------------------------
+def _merge_flags(*groups: list[str] | tuple[str, ...]) -> list[str]:
+    seen: set[str] = set()
+    merged: list[str] = []
+    for group in groups:
+        for flag in group:
+            if flag and flag not in seen:
+                seen.add(flag)
+                merged.append(flag)
+    return merged
 
-async def _fetch_spot_with_fallbacks(
-    client: httpx.AsyncClient,
+
+def _candle_close_iso(candle: dict[str, float], interval_seconds: int) -> str:
+    close_ms = int(candle["t"]) + interval_seconds * 1000
+    return datetime.fromtimestamp(close_ms / 1000.0, tz=UTC).isoformat()
+
+
+def _downgrade_confidence(confidence: str) -> str:
+    if confidence == "high":
+        return "medium"
+    if confidence == "medium":
+        return "low"
+    return confidence
+
+
+def _ohlcv_label(snapshot: OhlcvSnapshot | None) -> str | None:
+    if snapshot is None or not snapshot.candles:
+        return None
+    return f"{snapshot.venue} ({len(snapshot.candles)} candles)"
+
+
+def _usable_book(
+    book: BookSnapshot | None,
+    spot: float,
+    flags: list[str],
+) -> tuple[list[tuple[float, float]], list[tuple[float, float]], BookSnapshot | None]:
+    """Reject a book whose midpoint diverged from the verified spot anchor."""
+    if book is None or not book.bids or not book.asks:
+        flags.append("ORDER_BOOK_UNAVAILABLE")
+        return [], [], None
+
+    mid = (book.bids[0][0] + book.asks[0][0]) / 2.0
+    if spot > 0 and abs(mid - spot) / spot > _ORDER_BOOK_MAX_DEVIATION:
+        flags.append("ORDER_BOOK_REJECTED_DIVERGENT_MID")
+        logger.warning(
+            "Rejected crypto order book whose midpoint diverged from spot",
+            venue=book.venue,
+            mid=mid,
+            spot=spot,
+            deviation_pct=round((mid - spot) / spot * 100.0, 3),
+        )
+        return [], [], None
+
+    return book.bids, book.asks, book
+
+
+def _resolve_spot(
+    *,
     symbol: str,
-    displayed_spot_price: float | None = None,
-) -> tuple[float, str]:
+    spot_snapshot: SpotSnapshot | None,
+    ohlcv_15m: OhlcvSnapshot | None,
+    ohlcv_1h: OhlcvSnapshot | None,
+    displayed_spot_price: float | None,
+    flags: list[str],
+) -> tuple[float, str, str | None, bool, dict[str, float], float | None, int]:
+    """Apply the documented spot fallback order.
+
+    Returns ``(spot, source, observed_at, screenshot_anchored, quotes,
+    dispersion_bps, venue_count)``.
     """
-    Fetch spot price across exchange cascade with point-in-time screenshot fallback.
-    Returns (spot_price, source_name).
-    """
-    pair_usdt = f"{symbol}USDT"
+    if spot_snapshot is not None and spot_snapshot.price > 0:
+        quotes = {quote.venue: quote.price for quote in spot_snapshot.quotes}
+        observed_at = (
+            min(quote.observed_at for quote in spot_snapshot.quotes).isoformat()
+            if spot_snapshot.quotes
+            else None
+        )
+        if len(spot_snapshot.quotes) < 3:
+            flags.append("SPOT_CONSENSUS_THIN")
+        if spot_snapshot.dispersion_bps > _SPOT_DISPERSION_WARNING_BPS:
+            flags.append("SPOT_FEED_DISPERSION_HIGH")
+        return (
+            spot_snapshot.price,
+            spot_snapshot.source,
+            observed_at,
+            False,
+            quotes,
+            spot_snapshot.dispersion_bps,
+            len(spot_snapshot.quotes),
+        )
 
-    # 1. Binance Global Spot
-    data = await _safe_get(client, f"{_BINANCE_SPOT}/api/v3/ticker/price", params={"symbol": pair_usdt}, label=f"spot_binance_{symbol}")
-    if isinstance(data, dict) and "price" in data:
-        try:
-            return float(data["price"]), "Binance Global"
-        except (ValueError, TypeError):
-            pass
+    flags.append("LIVE_SPOT_UNAVAILABLE")
 
-    # 2. Binance US Spot
-    data = await _safe_get(client, f"{_BINANCE_US}/api/v3/ticker/price", params={"symbol": pair_usdt}, label=f"spot_binanceus_{symbol}")
-    if isinstance(data, dict) and "price" in data:
-        try:
-            return float(data["price"]), "Binance US"
-        except (ValueError, TypeError):
-            pass
+    if ohlcv_15m is not None and ohlcv_15m.candles:
+        candle = ohlcv_15m.candles[-1]
+        flags.append("SPOT_FROM_15M_CANDLE_CLOSE")
+        return (
+            candle["c"],
+            f"15m candle close ({ohlcv_15m.venue})",
+            _candle_close_iso(candle, 900),
+            False,
+            {},
+            None,
+            0,
+        )
 
-    # 3. OKX Spot
-    data = await _safe_get(client, f"{_OKX}/api/v5/market/ticker", params={"instId": f"{symbol}-USDT"}, label=f"spot_okx_{symbol}")
-    if isinstance(data, dict) and data.get("data"):
-        try:
-            return float(data["data"][0]["last"]), "OKX"
-        except (IndexError, KeyError, ValueError, TypeError):
-            pass
+    if ohlcv_1h is not None and ohlcv_1h.candles:
+        candle = ohlcv_1h.candles[-1]
+        flags.append("SPOT_FROM_1H_CANDLE_CLOSE")
+        return (
+            candle["c"],
+            f"1h candle close ({ohlcv_1h.venue})",
+            _candle_close_iso(candle, 3600),
+            False,
+            {},
+            None,
+            0,
+        )
 
-    # 4. Bybit Spot
-    data = await _safe_get(client, f"{_BYBIT}/v5/market/tickers", params={"category": "spot", "symbol": pair_usdt}, label=f"spot_bybit_{symbol}")
-    if isinstance(data, dict):
-        try:
-            items = data.get("result", {}).get("list", [])
-            if items:
-                return float(items[0]["lastPrice"]), "Bybit"
-        except (IndexError, KeyError, ValueError, TypeError):
-            pass
-
-    # 5. Coinbase Spot
-    data = await _safe_get(client, f"{_COINBASE_API}/v2/prices/{symbol}-USD/spot", label=f"spot_coinbase_{symbol}")
-    if isinstance(data, dict):
-        try:
-            amt = data.get("data", {}).get("amount")
-            if amt:
-                return float(amt), "Coinbase"
-        except (ValueError, TypeError):
-            pass
-
-    # 6. Kraken Spot
-    kraken_pair = _KRAKEN_PAIR_MAP.get(symbol, f"{symbol}USD")
-    data = await _safe_get(client, f"{_KRAKEN}/0/public/Ticker", params={"pair": kraken_pair}, label=f"spot_kraken_{symbol}")
-    if isinstance(data, dict) and data.get("result"):
-        try:
-            pair_data = next(iter(data["result"].values()))
-            return float(pair_data["c"][0]), "Kraken"
-        except (KeyError, IndexError, ValueError, TypeError):
-            pass
-
-    # 7. CoinGecko Spot
-    cg_id = _COINGECKO_MAP.get(symbol)
-    if cg_id:
-        data = await _safe_get(client, f"{_COINGECKO}/api/v3/simple/price", params={"ids": cg_id, "vs_currencies": "usd"}, label=f"spot_coingecko_{symbol}")
-        if isinstance(data, dict) and cg_id in data:
-            try:
-                return float(data[cg_id]["usd"]), "CoinGecko"
-            except (KeyError, ValueError, TypeError):
-                pass
-
-    # 8. Point-in-Time Screenshot Grounding
     if displayed_spot_price is not None and displayed_spot_price > 0:
-        logger.info(
-            "Live exchange APIs unreachable; anchored to screenshot point-in-time spot",
+        flags.append("ANCHORED_TO_SCREENSHOT_SPOT")
+        logger.warning(
+            "Live exchange APIs unavailable; anchoring to screenshot spot",
             symbol=symbol,
             spot=displayed_spot_price,
         )
-        return displayed_spot_price, "Screenshot Point-in-Time Spot"
+        return (
+            displayed_spot_price,
+            "Screenshot Point-in-Time Spot",
+            None,
+            True,
+            {},
+            None,
+            0,
+        )
 
-    return 0.0, "Unknown"
-
-
-async def _fetch_ohlcv_resilient(
-    client: httpx.AsyncClient,
-    symbol: str,
-    interval: str,
-    limit: int = 96,
-) -> list[dict[str, float]]:
-    """Fetch OHLCV candles from Binance Global with Binance US, OKX, and Bybit fallbacks."""
-    pair_usdt = f"{symbol}USDT"
-
-    # Venue 1: Binance Global
-    data = await _safe_get(
-        client,
-        f"{_BINANCE_SPOT}/api/v3/klines",
-        params={"symbol": pair_usdt, "interval": interval, "limit": limit},
-        label=f"ohlcv_{interval}_binance_{symbol}",
-    )
-    if isinstance(data, list) and data:
-        candles = []
-        for row in data:
-            try:
-                candles.append({
-                    "o": float(row[1]), "h": float(row[2]), "l": float(row[3]), "c": float(row[4]), "v": float(row[5]),
-                })
-            except (IndexError, ValueError, TypeError):
-                continue
-        if candles:
-            return candles
-
-    # Venue 2: Binance US
-    data = await _safe_get(
-        client,
-        f"{_BINANCE_US}/api/v3/klines",
-        params={"symbol": pair_usdt, "interval": interval, "limit": limit},
-        label=f"ohlcv_{interval}_binanceus_{symbol}",
-    )
-    if isinstance(data, list) and data:
-        candles = []
-        for row in data:
-            try:
-                candles.append({
-                    "o": float(row[1]), "h": float(row[2]), "l": float(row[3]), "c": float(row[4]), "v": float(row[5]),
-                })
-            except (IndexError, ValueError, TypeError):
-                continue
-        if candles:
-            return candles
-
-    # Venue 3: OKX Candles
-    okx_bar = "15m" if interval == "15m" else "1H"
-    data = await _safe_get(
-        client,
-        f"{_OKX}/api/v5/market/candles",
-        params={"instId": f"{symbol}-USDT", "bar": okx_bar, "limit": str(limit)},
-        label=f"ohlcv_{interval}_okx_{symbol}",
-    )
-    if isinstance(data, dict) and data.get("data"):
-        candles = []
-        # OKX returns reverse chronological order: [ts, o, h, l, c, vol, ...]
-        for row in reversed(data["data"]):
-            try:
-                candles.append({
-                    "o": float(row[1]), "h": float(row[2]), "l": float(row[3]), "c": float(row[4]), "v": float(row[5]),
-                })
-            except (IndexError, ValueError, TypeError):
-                continue
-        if candles:
-            return candles
-
-    # Venue 4: Bybit Klines
-    bybit_interval = "15" if interval == "15m" else "60"
-    data = await _safe_get(
-        client,
-        f"{_BYBIT}/v5/market/kline",
-        params={"category": "spot", "symbol": pair_usdt, "interval": bybit_interval, "limit": limit},
-        label=f"ohlcv_{interval}_bybit_{symbol}",
-    )
-    if isinstance(data, dict):
-        raw_list = data.get("result", {}).get("list", [])
-        if raw_list:
-            candles = []
-            for row in reversed(raw_list):
-                try:
-                    candles.append({
-                        "o": float(row[1]), "h": float(row[2]), "l": float(row[3]), "c": float(row[4]), "v": float(row[5]),
-                    })
-                except (IndexError, ValueError, TypeError):
-                    continue
-            if candles:
-                return candles
-
-    return []
+    return 0.0, "Unavailable", None, False, {}, None, 0
 
 
-async def _fetch_order_book_resilient(
-    client: httpx.AsyncClient,
-    symbol: str,
-    limit: int = 20,
-) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
-    """Fetch order book from Binance Global with Binance US, OKX, and Bybit fallbacks."""
-    pair_usdt = f"{symbol}USDT"
+def _derive_24h_stats(
+    candles_1h: list[dict[str, float]],
+    spot: float,
+) -> tuple[float, float, float]:
+    """Return ``(price_change_pct, high, low)`` from the last 24 hourly candles."""
+    if not candles_1h:
+        return 0.0, 0.0, 0.0
 
-    # Venue 1: Binance Global
-    data = await _safe_get(client, f"{_BINANCE_SPOT}/api/v3/depth", params={"symbol": pair_usdt, "limit": limit}, label=f"depth_binance_{symbol}")
-    if isinstance(data, dict) and "bids" in data:
-        try:
-            return [(float(p), float(q)) for p, q in data.get("bids", [])], [(float(p), float(q)) for p, q in data.get("asks", [])]
-        except (ValueError, TypeError):
-            pass
+    window = candles_1h[-24:]
+    high = max(candle["h"] for candle in window)
+    low = min(candle["l"] for candle in window)
+    if spot > 0:
+        high = max(high, spot)
+        low = min(low, spot)
 
-    # Venue 2: Binance US
-    data = await _safe_get(client, f"{_BINANCE_US}/api/v3/depth", params={"symbol": pair_usdt, "limit": limit}, label=f"depth_binanceus_{symbol}")
-    if isinstance(data, dict) and "bids" in data:
-        try:
-            return [(float(p), float(q)) for p, q in data.get("bids", [])], [(float(p), float(q)) for p, q in data.get("asks", [])]
-        except (ValueError, TypeError):
-            pass
-
-    # Venue 3: OKX Books
-    data = await _safe_get(client, f"{_OKX}/api/v5/market/books", params={"instId": f"{symbol}-USDT", "sz": str(limit)}, label=f"depth_okx_{symbol}")
-    if isinstance(data, dict) and data.get("data"):
-        try:
-            book = data["data"][0]
-            bids = [(float(row[0]), float(row[1])) for row in book.get("bids", [])]
-            asks = [(float(row[0]), float(row[1])) for row in book.get("asks", [])]
-            return bids, asks
-        except (IndexError, KeyError, ValueError, TypeError):
-            pass
-
-    # Venue 4: Bybit Order Book
-    data = await _safe_get(client, f"{_BYBIT}/v5/market/orderbook", params={"category": "spot", "symbol": pair_usdt, "limit": limit}, label=f"depth_bybit_{symbol}")
-    if isinstance(data, dict):
-        try:
-            res = data.get("result", {})
-            bids = [(float(p), float(q)) for p, q in res.get("b", [])]
-            asks = [(float(p), float(q)) for p, q in res.get("a", [])]
-            if bids or asks:
-                return bids, asks
-        except (ValueError, TypeError):
-            pass
-
-    return [], []
+    reference = candles_1h[-25]["c"] if len(candles_1h) >= 25 else candles_1h[0]["c"]
+    change_pct = (spot / reference - 1.0) * 100.0 if reference > 0 and spot > 0 else 0.0
+    return change_pct, high, low
 
 
-async def _fetch_derivatives(
-    client: httpx.AsyncClient, symbol: str
-) -> tuple[float, float | None]:
-    """Fetch perpetual funding rate and open interest from Binance Futures."""
-    funding_rate = 0.0
-    open_interest = None
+def _build_data_sources(
+    spot_source: str,
+    ohlcv_15m: OhlcvSnapshot | None,
+    ohlcv_1h: OhlcvSnapshot | None,
+    book: BookSnapshot | None,
+    derivatives: DerivativesSnapshot | None,
+    fear_greed: FearGreedSnapshot | None,
+) -> list[str]:
+    sources = [spot_source, "Concurrent multi-venue mesh"]
+    if ohlcv_15m is not None:
+        sources.append(f"15m OHLCV: {ohlcv_15m.venue}")
+    if ohlcv_1h is not None:
+        sources.append(f"1h OHLCV: {ohlcv_1h.venue}")
+    if book is not None:
+        sources.append(f"Order book: {book.venue}")
+    if derivatives is not None:
+        if derivatives.funding_source:
+            sources.append(f"Funding: {derivatives.funding_source}")
+        if derivatives.open_interest_source:
+            sources.append(f"Open interest: {derivatives.open_interest_source}")
+    if fear_greed is not None:
+        sources.append(fear_greed.source)
+    return _merge_flags(sources)
 
-    fdata = await _safe_get(client, f"{_BINANCE_FUTURES}/fapi/v1/fundingRate", params={"symbol": f"{symbol}USDT", "limit": 1}, label=f"funding_{symbol}")
-    if isinstance(fdata, list) and fdata:
-        try:
-            funding_rate = float(fdata[0].get("fundingRate", 0)) * 100.0
-        except (KeyError, ValueError, TypeError):
-            pass
 
-    oidata = await _safe_get(client, f"{_BINANCE_FUTURES}/fapi/v1/openInterest", params={"symbol": f"{symbol}USDT"}, label=f"oi_{symbol}")
-    if isinstance(oidata, dict):
-        try:
-            open_interest = float(oidata.get("openInterest", 0))
-        except (ValueError, TypeError):
-            pass
+def _apply_sentiment(
+    context: dict[str, Any],
+    fear_greed: FearGreedSnapshot | None,
+) -> None:
+    if fear_greed is None:
+        return
+    context["fear_greed_index"] = fear_greed.value
+    context["fear_greed_classification"] = fear_greed.classification
+    if fear_greed.value < 20:
+        context["sentiment_signal"] = "Extreme Fear — potential capitulation/bounce"
+    elif fear_greed.value > 80:
+        context["sentiment_signal"] = "Extreme Greed — elevated crash risk"
+    else:
+        context["sentiment_signal"] = f"{fear_greed.classification} ({fear_greed.value}/100)"
 
-    return funding_rate, open_interest
 
+def _apply_derivatives(
+    context: dict[str, Any],
+    derivatives: DerivativesSnapshot | None,
+    spot: float,
+    flags: list[str],
+) -> None:
+    if derivatives is None:
+        flags.append("DERIVATIVES_UNAVAILABLE")
+        return
 
-async def _fetch_fear_and_greed(client: httpx.AsyncClient) -> dict[str, Any]:
-    """Fetch Fear & Greed index from alternative.me."""
-    data = await _safe_get(client, _FEAR_GREED, label="fear_greed")
-    if not isinstance(data, dict):
-        return {}
-    try:
-        entry = data.get("data", [{}])[0]
-        return {
-            "value": int(entry.get("value", 50)),
-            "classification": entry.get("value_classification", "Neutral"),
-        }
-    except (IndexError, KeyError, ValueError, TypeError):
-        return {}
+    if derivatives.funding_rate_pct is None:
+        flags.append("FUNDING_RATE_UNAVAILABLE")
+    else:
+        context["funding_source"] = derivatives.funding_source
+
+    if derivatives.open_interest_base is None:
+        flags.append("OPEN_INTEREST_UNAVAILABLE")
+    else:
+        context["open_interest_base"] = derivatives.open_interest_base
+        context["open_interest_source"] = derivatives.open_interest_source
+        context["open_interest_usd"] = f"${derivatives.open_interest_base * spot:,.0f}"
+
+    if derivatives.open_interest_change_pct is None:
+        flags.append("OPEN_INTEREST_CHANGE_UNAVAILABLE")
+    else:
+        context["open_interest_change_pct"] = f"{derivatives.open_interest_change_pct:+.3f}%"
+        context["open_interest_change_source"] = derivatives.open_interest_change_source
 
 
 # ---------------------------------------------------------------------------
-# Main Public Research Interface
+# Main public research interface
 # ---------------------------------------------------------------------------
+
 
 async def gather_crypto_intelligence(
     title: str,
@@ -471,177 +420,236 @@ async def gather_crypto_intelligence(
     target_price: float | None = None,
     displayed_spot_price: float | None = None,
     http_client: httpx.AsyncClient | None = None,
+    settings: Settings | None = None,
 ) -> dict[str, Any]:
-    """
-    Gather comprehensive crypto intelligence with resilient multi-venue fallbacks
-    and point-in-time screenshot grounding.
+    """Gather comprehensive crypto intelligence from the multi-venue mesh.
 
-    Args:
-        title: Market title/question string.
-        platform: "polymarket", "bayse", or "unknown".
-        closes_at: Contract expiry datetime (UTC).
-        underlying_symbol: Ticker override (e.g. "BTC").
-        target_price: Strike price override.
-        displayed_spot_price: Screenshot extracted point-in-time spot price.
-        http_client: Shared httpx async client.
+    All data groups run concurrently.  The shared HTTP client should come from
+    :func:`prediction_ai.integrations.network.build_resilient_client` so that
+    market-data DNS failures fall back to DNS-over-HTTPS instead of producing a
+    misleading ``ConnectTimeout`` for every venue.
     """
+    del platform  # retained for interface compatibility; venues are platform-neutral
     now = datetime.now(UTC)
     researched_at = now.isoformat()
+    resolved_settings = settings or get_settings()
+    budget = resolved_settings.MARKET_DATA_GROUP_BUDGET_SECONDS
 
     symbol = underlying_symbol or _infer_symbol(title)
     strike, direction = _parse_strike_and_direction(title)
     if target_price is not None:
         strike = target_price
 
-    # Compute seconds to expiry
-    seconds_to_expiry = 900.0  # default 15 minutes
+    seconds_to_expiry = 900.0
     if closes_at:
         delta = (closes_at - now).total_seconds()
         if delta > 0:
             seconds_to_expiry = delta
 
     own_client = http_client is None
-    client = http_client or httpx.AsyncClient(timeout=_TIMEOUT)
+    client = http_client or build_resilient_client(resolved_settings)
 
     try:
-        # 1. Fetch spot price with multi-venue cascade + screenshot fallback
-        spot, spot_source = await _fetch_spot_with_fallbacks(
-            client=client,
-            symbol=symbol,
-            displayed_spot_price=displayed_spot_price,
-        )
-
-        # 2. Concurrently fetch candles, order book, derivatives, and sentiment
         (
+            spot_snapshot,
             ohlcv_15m,
             ohlcv_1h,
-            (bids, asks),
-            (funding_rate, oi_value),
+            book_snapshot,
+            derivatives,
             fear_greed,
         ) = await asyncio.gather(
-            _fetch_ohlcv_resilient(client, symbol, "15m", limit=96),
-            _fetch_ohlcv_resilient(client, symbol, "1h", limit=48),
-            _fetch_order_book_resilient(client, symbol, limit=20),
-            _fetch_derivatives(client, symbol),
-            _fetch_fear_and_greed(client),
-            return_exceptions=False,
+            fetch_spot_snapshot(client, symbol, budget_seconds=budget),
+            fetch_ohlcv_snapshot(client, symbol, "15m", 96, budget_seconds=budget),
+            fetch_ohlcv_snapshot(client, symbol, "1h", 48, budget_seconds=budget),
+            fetch_order_book_snapshot(client, symbol, 20, budget_seconds=budget),
+            fetch_derivatives_snapshot(client, symbol, budget_seconds=budget),
+            fetch_fear_and_greed(client),
         )
 
-        # 3. Retrieve persistent SQLite calibration multiplier
-        vol_multiplier = 1.0
-        try:
-            from prediction_ai.db.sqlite import get_sqlite_db
-            sqlite = get_sqlite_db()
-            cal = await sqlite.get_asset_calibration(symbol)
-            vol_multiplier = float(cal.get("vol_multiplier", 1.0))
-        except Exception:
-            pass
+        candles_15m = list(ohlcv_15m.candles) if ohlcv_15m is not None else []
+        candles_1h = list(ohlcv_1h.candles) if ohlcv_1h is not None else []
+        flags: list[str] = []
 
-        # If spot was unavailable from exchanges, fallback to candle close
-        if spot <= 0 and ohlcv_15m:
-            spot = ohlcv_15m[-1]["c"]
-            spot_source = "15m Candle Close"
-        elif spot <= 0 and ohlcv_1h:
-            spot = ohlcv_1h[-1]["c"]
-            spot_source = "1h Candle Close"
+        spot, spot_source, spot_observed_at, screenshot_anchored, spot_quotes, dispersion, venue_count = (
+            _resolve_spot(
+                symbol=symbol,
+                spot_snapshot=spot_snapshot,
+                ohlcv_15m=ohlcv_15m,
+                ohlcv_1h=ohlcv_1h,
+                displayed_spot_price=displayed_spot_price,
+                flags=flags,
+            )
+        )
 
-        # 4. Critical Data Check: If spot is still missing, we cannot compute option prob
         if spot <= 0:
-            logger.warning("No spot price could be resolved across exchanges or screenshot", symbol=symbol)
+            logger.warning(
+                "No spot price could be resolved across exchanges, candles, or screenshot",
+                symbol=symbol,
+            )
             return {
                 "status": "DATA_UNAVAILABLE",
                 "symbol": symbol,
+                "strike": strike,
+                "direction": direction,
+                "spot_source": spot_source,
                 "researched_at": researched_at,
-                "adjusted_prob_yes": 0.5,
-                "data_quality_flags": ["SPOT_PRICE_UNAVAILABLE"],
-                "note": "All exchange feeds and screenshot OCR spot were unavailable. Prior 0.50 used.",
+                "adjusted_prob_yes": None,
+                "final_adjusted_prob_yes": None,
+                "data_quality_flags": _merge_flags(flags, ["SPOT_PRICE_UNAVAILABLE"]),
+                "note": (
+                    "All exchange feeds, fallback candles, and screenshot OCR spot were "
+                    "unavailable. No probability prior is emitted; the analysis stops."
+                ),
             }
 
-        # 5. Strike check
+        bids, asks, usable_book = _usable_book(book_snapshot, spot, flags)
+        price_change_24h_pct, high_24h, low_24h = _derive_24h_stats(candles_1h, spot)
+
+        funding_rate = (
+            derivatives.funding_rate_pct
+            if derivatives is not None and derivatives.funding_rate_pct is not None
+            else 0.0
+        )
+        oi_change_pct = (
+            derivatives.open_interest_change_pct
+            if derivatives is not None and derivatives.open_interest_change_pct is not None
+            else 0.0
+        )
+
         if strike is None or strike <= 0:
-            closes_1h_prices = [c["c"] for c in ohlcv_1h]
+            closes_1h_prices = [candle["c"] for candle in candles_1h]
             base_vol = _ASSET_BASE_VOL.get(symbol, 0.70)
-            vol_24h = realized_vol_annualized(closes_1h_prices, 60) if closes_1h_prices else base_vol
+            vol_24h = (
+                realized_vol_annualized(closes_1h_prices, 60)
+                if closes_1h_prices
+                else base_vol
+            )
             return {
                 "status": "STRIKE_UNKNOWN",
                 "symbol": symbol,
+                "strike": None,
+                "direction": direction,
                 "spot_price_usd": f"{spot:,.2f}",
                 "spot_source": spot_source,
+                "spot_observed_at": spot_observed_at,
                 "vol_24h_annualized": f"{vol_24h:.2%}",
                 "funding_rate_pct_per_8h": f"{funding_rate:.4f}%",
                 "funding_signal": interpret_funding_rate(funding_rate),
                 "researched_at": researched_at,
-                "adjusted_prob_yes": 0.5,
-                "data_quality_flags": ["STRIKE_PRICE_NOT_DETECTED"],
-                "note": "Could not detect strike price from contract proposition. Please confirm target price.",
+                "adjusted_prob_yes": None,
+                "final_adjusted_prob_yes": None,
+                "data_quality_flags": _merge_flags(
+                    flags, ["STRIKE_PRICE_NOT_DETECTED"]
+                ),
+                "note": (
+                    "Could not detect strike price from contract proposition. "
+                    "Please confirm target price."
+                ),
             }
 
-        # 6. Build quantitative market features
+        vol_multiplier = await _load_vol_multiplier(symbol)
         features = build_features(
             symbol=symbol,
             spot_price=spot,
             strike_price=strike,
             seconds_to_expiry=seconds_to_expiry,
-            ohlcv_15m=ohlcv_15m,
-            ohlcv_1h=ohlcv_1h,
+            ohlcv_15m=candles_15m,
+            ohlcv_1h=candles_1h,
             bids=bids,
             asks=asks,
             funding_rate_pct=funding_rate,
-            oi_change_pct=0.0,
-            price_change_24h_pct=0.0,
-            high_24h=spot * 1.02,
-            low_24h=spot * 0.98,
+            oi_change_pct=oi_change_pct,
+            price_change_24h_pct=price_change_24h_pct,
+            high_24h=high_24h,
+            low_24h=low_24h,
             vol_multiplier=vol_multiplier,
         )
+
+        flags = _merge_flags(flags, features.data_quality_flags)
+        confidence = features.signal_confidence
+        if screenshot_anchored:
+            confidence = "low"
+        elif "SPOT_FROM_15M_CANDLE_CLOSE" in flags or "SPOT_FROM_1H_CANDLE_CLOSE" in flags:
+            confidence = _downgrade_confidence(confidence)
 
         final_prob = features.adjusted_prob_yes
         if direction == "below":
             final_prob = 1.0 - final_prob
-            features.key_signals.insert(0, f"Market asks for price BELOW {strike:,.2f} — probability inverted")
+            features.key_signals.insert(
+                0,
+                f"Market asks for price BELOW {strike:,.2f} — probability inverted",
+            )
 
         context = features.to_context_dict()
-        context.update({
-            "direction": direction,
-            "spot_source": spot_source,
-            "final_adjusted_prob_yes": f"{final_prob:.4f}",
-            "researched_at": researched_at,
-            "data_sources": [spot_source, "Resilient Multi-Venue Mesh"],
-            "vol_methodology": "EWMA / Calibrated Digital Option",
-            "pricing_model": "Log-normal digital option (Black-Scholes, r=0)",
-        })
+        context.update(
+            {
+                "strike": strike,
+                "direction": direction,
+                "spot_source": spot_source,
+                "spot_observed_at": spot_observed_at,
+                "spot_quotes": spot_quotes,
+                "spot_venue_count": venue_count,
+                "spot_dispersion_bps": round(dispersion, 2) if dispersion is not None else None,
+                "ohlcv_15m_source": _ohlcv_label(ohlcv_15m),
+                "ohlcv_1h_source": _ohlcv_label(ohlcv_1h),
+                "order_book_source": usable_book.venue if usable_book is not None else None,
+                "order_book_spread_bps": (
+                    round(
+                        (usable_book.asks[0][0] - usable_book.bids[0][0])
+                        / ((usable_book.asks[0][0] + usable_book.bids[0][0]) / 2.0)
+                        * 10_000.0,
+                        2,
+                    )
+                    if usable_book is not None
+                    else None
+                ),
+                "price_change_24h_pct": f"{price_change_24h_pct:+.3f}%",
+                "high_24h_usd": f"{high_24h:,.2f}" if high_24h > 0 else None,
+                "low_24h_usd": f"{low_24h:,.2f}" if low_24h > 0 else None,
+                "final_adjusted_prob_yes": f"{final_prob:.4f}",
+                "signal_confidence": confidence,
+                "researched_at": researched_at,
+                "data_sources": _build_data_sources(
+                    spot_source,
+                    ohlcv_15m,
+                    ohlcv_1h,
+                    usable_book,
+                    derivatives,
+                    fear_greed,
+                ),
+                "data_quality_flags": flags,
+                "vol_methodology": "EWMA / Calibrated Digital Option",
+                "pricing_model": "Log-normal digital option (Black-Scholes, r=0)",
+            }
+        )
 
-        if spot_source == "Screenshot Point-in-Time Spot":
+        if screenshot_anchored:
             context["screenshot_anchored"] = True
-            context["data_quality_flags"] = ["ANCHORED_TO_SCREENSHOT_SPOT"]
 
-        if fear_greed:
-            fg_val = fear_greed.get("value", 50)
-            fg_class = fear_greed.get("classification", "Neutral")
-            context["fear_greed_index"] = fg_val
-            context["fear_greed_classification"] = fg_class
-            if fg_val < 20:
-                context["sentiment_signal"] = "Extreme Fear — potential capitulation/bounce"
-            elif fg_val > 80:
-                context["sentiment_signal"] = "Extreme Greed — elevated crash risk"
-            else:
-                context["sentiment_signal"] = f"{fg_class} ({fg_val}/100)"
+        _apply_derivatives(context, derivatives, spot, flags)
+        if fear_greed is None:
+            flags.append("FEAR_GREED_UNAVAILABLE")
+        _apply_sentiment(context, fear_greed)
 
-        if oi_value is not None:
-            context["open_interest_usd"] = f"${oi_value * spot:,.0f}"
+        # Keep the final flag list authoritative after helpers append to it.
+        context["data_quality_flags"] = _merge_flags(flags)
+        context["signal_confidence"] = confidence
 
         logger.info(
-            "Resilient crypto intelligence successfully computed",
+            "Crypto intelligence computed from multi-venue mesh",
             symbol=symbol,
             spot=spot,
             spot_source=spot_source,
+            spot_venues=venue_count,
+            spot_dispersion_bps=round(dispersion, 2) if dispersion is not None else None,
             strike=strike,
             direction=direction,
             seconds_to_expiry=int(seconds_to_expiry),
             base_prob=f"{features.base_prob_yes:.4f}",
-            adjusted_prob=f"{final_prob:.4f}",
-            confidence=features.signal_confidence,
+            final_prob=f"{final_prob:.4f}",
+            confidence=confidence,
+            data_quality_flags=flags,
         )
-
         return context
     finally:
         if own_client:

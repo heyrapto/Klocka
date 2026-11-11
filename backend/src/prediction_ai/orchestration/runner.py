@@ -2,6 +2,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import Any
 from uuid import UUID, uuid4
 
 import httpx
@@ -11,21 +12,116 @@ from prediction_ai.core.config import Settings, get_settings
 from prediction_ai.core.workflow import AnalysisStatus, EventType, Stage
 from prediction_ai.db.mongo import get_mongo_db
 from prediction_ai.db.sqlite import get_sqlite_db
+from prediction_ai.decision.costs import walk_book_for_notional
 from prediction_ai.decision.engine import evaluate_decision
 from prediction_ai.forecasting.gemini_forecaster import GeminiForecaster
 from prediction_ai.integrations.bayse import BayseAdapter
 from prediction_ai.integrations.http import ProviderHttpClient
+from prediction_ai.integrations.network import build_resilient_client
 from prediction_ai.integrations.polymarket import PolymarketAdapter
+from prediction_ai.markets.contract_spec import build_contract_spec
 from prediction_ai.markets.matcher import match_candidate_to_platform_market
+from prediction_ai.markets.quote_mapping import find_outcome_quote as _find_outcome_quote
 from prediction_ai.orchestration.events import EventRecorder
 from prediction_ai.schemas.analysis import ScreenshotMarketCandidate
-from prediction_ai.schemas.market import NormalizedMarket
+from prediction_ai.schemas.contract import ContractSpec
+from prediction_ai.schemas.market import (
+    NormalizedMarket,
+    NormalizedOutcome,
+)
 from prediction_ai.specialists.research import SpecialistResearchService
 from prediction_ai.storage.factory import create_storage
 from prediction_ai.vision.factory import create_vision_extractor
 from prediction_ai.vision.images import inspect_image
 
 logger = structlog.get_logger(__name__)
+
+_AFFIRMATIVE_LABELS = frozenset({"yes", "up", "higher", "over", "above", "buy up", "buy yes"})
+_NEGATIVE_LABELS = frozenset({"no", "down", "lower", "under", "below", "buy down", "buy no"})
+
+
+def _quote_age_seconds(observed_at: datetime, decision_at: datetime) -> Decimal:
+    observed = observed_at if observed_at.tzinfo is not None else observed_at.replace(tzinfo=UTC)
+    decision = decision_at if decision_at.tzinfo is not None else decision_at.replace(tzinfo=UTC)
+    return Decimal(str(round(max(0.0, (decision - observed).total_seconds()), 3)))
+
+
+def _market_outcome(
+    market: NormalizedMarket,
+    *,
+    outcome_id: str | None,
+    token_id: str | None,
+) -> NormalizedOutcome | None:
+    """Resolve one market outcome by ID, falling back to its token ID."""
+    if outcome_id:
+        match = next(
+            (item for item in market.outcomes if item.outcome_id == outcome_id),
+            None,
+        )
+        if match is not None:
+            return match
+    if token_id:
+        return next(
+            (item for item in market.outcomes if item.token_id == token_id),
+            None,
+        )
+    return None
+
+
+def _build_target_definition(
+    market: NormalizedMarket,
+    contract_spec: ContractSpec,
+) -> dict[str, Any]:
+    """Describe the exact event that ``probability_yes`` refers to.
+
+    The affirmative/negative ordering is explicit because a generic
+    ``["YES", "NO"]`` label loses the UP/DOWN direction used by crypto
+    interval contracts.
+    """
+    affirmative = _market_outcome(
+        market,
+        outcome_id=contract_spec.affirmative_outcome_id,
+        token_id=contract_spec.affirmative_token_id,
+    )
+    negative = _market_outcome(
+        market,
+        outcome_id=contract_spec.negative_outcome_id,
+        token_id=contract_spec.negative_token_id,
+    )
+    mapping_complete = affirmative is not None and negative is not None
+    if mapping_complete:
+        assert affirmative is not None and negative is not None
+        outcome_labels = [affirmative.label, negative.label]
+    else:
+        outcome_labels = [item.label for item in market.outcomes]
+
+    return {
+        "question": market.title,
+        "outcomes": outcome_labels,
+        "outcome_mapping_complete": mapping_complete,
+        "affirmative_label": affirmative.label if affirmative is not None else None,
+        "negative_label": negative.label if negative is not None else None,
+        "affirmative_outcome_id": contract_spec.affirmative_outcome_id,
+        "negative_outcome_id": contract_spec.negative_outcome_id,
+        "affirmative_token_id": contract_spec.affirmative_token_id,
+        "negative_token_id": contract_spec.negative_token_id,
+        "direction": contract_spec.direction,
+        "comparator": contract_spec.comparator,
+        "strike_value": (
+            str(contract_spec.strike_value)
+            if contract_spec.strike_value is not None
+            else None
+        ),
+        "strike_source": contract_spec.strike_source,
+        "settlement_source": contract_spec.settlement_source,
+        "settlement_timestamp": (
+            contract_spec.settlement_timestamp.isoformat()
+            if contract_spec.settlement_timestamp is not None
+            else None
+        ),
+        "tradeable": contract_spec.tradeable,
+        "contract_spec_hash": contract_spec.spec_hash,
+    }
 
 
 class AnalysisWorkflowRunner:
@@ -69,15 +165,15 @@ class AnalysisWorkflowRunner:
                 client=client,
             )
 
-    @staticmethod
     @asynccontextmanager
     async def _client_context(
+        self,
         client: httpx.AsyncClient | None,
     ) -> AsyncIterator[httpx.AsyncClient]:
         if client is not None:
             yield client
         else:
-            async with httpx.AsyncClient() as new_client:
+            async with build_resilient_client(self.settings) as new_client:
                 yield new_client
 
     async def _execute_pipeline(
@@ -427,15 +523,13 @@ class AnalysisWorkflowRunner:
             displayed_expiry=candidate.displayed_expiry,
             market_closes_at=best_market.closes_at,
         )
-        if best_market.resolves_at is None:
-            best_market.resolves_at = timing_ctx.exact_resolves_at
-        if best_market.closes_at is None:
-            best_market.closes_at = timing_ctx.exact_resolves_at
+        best_market.resolves_at = timing_ctx.exact_resolves_at
+        best_market.closes_at = timing_ctx.exact_resolves_at
 
         time_to_close = timing_ctx.decision_seconds_remaining
         forecast_cutoff = datetime.now(UTC)
 
-        category = best_market.category if best_market.category and best_market.category != "unknown" else "crypto"
+        category = best_market.category
         target_price_float = float(candidate.target_price) if candidate.target_price is not None else None
         displayed_price_float = float(candidate.displayed_underlying_price) if candidate.displayed_underlying_price is not None else None
         specialist_context = await specialist_service.gather_context(
@@ -491,6 +585,54 @@ class AnalysisWorkflowRunner:
                 )
                 return
 
+        if category == "crypto":
+            crypto_research = specialist_context.get("crypto_research") or {}
+            crypto_status = crypto_research.get("status")
+            if crypto_status in {"DATA_UNAVAILABLE", "STRIKE_UNKNOWN"}:
+                if crypto_status == "STRIKE_UNKNOWN":
+                    error_code = "CRYPTO_STRIKE_UNKNOWN"
+                    error_message = (
+                        "Crypto research resolved a spot price but could not verify the "
+                        "contract strike. No crypto forecast was produced; confirm the "
+                        "target price and retry."
+                    )
+                else:
+                    error_code = "CRYPTO_SPOT_UNAVAILABLE"
+                    error_message = (
+                        "Crypto research could not resolve a spot price from the exchange "
+                        "mesh, closed candles, or the screenshot. No crypto forecast was "
+                        "produced."
+                    )
+                await update_status(
+                    AnalysisStatus.RESEARCH_FAILED,
+                    error_code=error_code,
+                    error_message=error_message,
+                )
+                await recorder.emit(
+                    EventType.FAILED,
+                    Stage.FEATURE_BUILDING,
+                    {"error_code": error_code, "message": error_message},
+                )
+                return
+
+        crypto_research = specialist_context.get("crypto_research") or {}
+        strike_override: Decimal | None = None
+        raw_strike = crypto_research.get("strike") if category == "crypto" else None
+        if raw_strike is not None:
+            try:
+                parsed_strike = Decimal(str(raw_strike))
+                if parsed_strike > 0:
+                    strike_override = parsed_strike
+            except Exception:
+                strike_override = None
+
+        contract_spec = build_contract_spec(
+            best_market,
+            candidate,
+            settlement_timestamp=timing_ctx.exact_resolves_at,
+            strike_override=strike_override,
+        )
+
         await recorder.emit(
             EventType.STAGE,
             Stage.FEATURE_BUILDING,
@@ -498,6 +640,7 @@ class AnalysisWorkflowRunner:
                 "status": "completed",
                 "message": f"Domain research synthesized for {category.upper()}: intervals & momentum calibrated",
                 "specialist_context": specialist_context,
+                "contract_spec": contract_spec.model_dump(mode="json"),
             },
         )
 
@@ -514,6 +657,7 @@ class AnalysisWorkflowRunner:
         forecast_result = await forecaster.forecast(
             best_market,
             order_book,
+            contract_spec=contract_spec,
             specialist_context=specialist_context,
             screenshot_observation=screenshot_observation,
         )
@@ -536,21 +680,50 @@ class AnalysisWorkflowRunner:
             {"status": "in_progress", "message": "Evaluating expected value, execution friction, and risk limits"},
         )
 
-        ask_yes = Decimal("0.50")
-        ask_no = Decimal("0.50")
-        for q in order_book.quotes:
-            label = q.label.strip().lower()
-            if label in ("yes", "up", "higher", "over") and q.best_ask is not None:
-                ask_yes = q.best_ask
-            elif label in ("no", "down", "lower", "under") and q.best_ask is not None:
-                ask_no = q.best_ask
+        yes_quote = _find_outcome_quote(
+            order_book,
+            token_id=contract_spec.affirmative_token_id,
+            outcome_id=contract_spec.affirmative_outcome_id,
+            fallback_labels=_AFFIRMATIVE_LABELS,
+        )
+        no_quote = _find_outcome_quote(
+            order_book,
+            token_id=contract_spec.negative_token_id,
+            outcome_id=contract_spec.negative_outcome_id,
+            fallback_labels=_NEGATIVE_LABELS,
+        )
 
-        # If quotes are a binary pair that didn't match the standard labels, map index 0 to YES and 1 to NO
-        if ask_yes == Decimal("0.50") and ask_no == Decimal("0.50") and len(order_book.quotes) == 2:
-            if order_book.quotes[0].best_ask is not None:
-                ask_yes = order_book.quotes[0].best_ask
-            if order_book.quotes[1].best_ask is not None:
-                ask_no = order_book.quotes[1].best_ask
+        # Missing quotes stay missing.  Never substitute 0.50: that manufactures
+        # an executable price and can produce a fabricated trade recommendation.
+        ask_yes = yes_quote.best_ask if yes_quote is not None else None
+        ask_no = no_quote.best_ask if no_quote is not None else None
+
+        decision_at = datetime.now(UTC)
+        quote_age_seconds = _quote_age_seconds(order_book.observed_at, decision_at)
+        target_order_usd = Decimal(str(self.settings.DECISION_TARGET_ORDER_USD))
+        min_depth_usd = Decimal(str(self.settings.DECISION_MIN_DEPTH_USD))
+
+        yes_walk = (
+            walk_book_for_notional(yes_quote.asks, target_order_usd)
+            if yes_quote is not None
+            else None
+        )
+        no_walk = (
+            walk_book_for_notional(no_quote.asks, target_order_usd)
+            if no_quote is not None
+            else None
+        )
+
+        if ask_yes is not None and ask_no is not None:
+            spread_value = ask_yes + ask_no - Decimal("1.0")
+        else:
+            spread_value = None
+
+        critical_contract_flags = contract_spec.critical_flags()
+        resolution_flags = sorted(
+            set(critical_contract_flags) | set(forecast_result.resolution_risk_flags)
+        )
+        strict_crypto = category == "crypto" and self.settings.CONTRACT_SPEC_STRICT_CRYPTO
 
         decision = evaluate_decision(
             probability_yes=forecast_result.probability_yes,
@@ -558,10 +731,85 @@ class AnalysisWorkflowRunner:
             ask_no=ask_no,
             min_edge=Decimal(str(self.settings.DECISION_MIN_EDGE)),
             max_spread=Decimal(str(self.settings.DECISION_MAX_SPREAD)),
+            spread=spread_value,
+            uncertainty_margin=Decimal(str(self.settings.DECISION_UNCERTAINTY_MARGIN)),
+            taker_fee_rate_yes=best_market.taker_fee_rate,
+            taker_fee_rate_no=best_market.taker_fee_rate,
+            fee_model=best_market.fee_model,
+            slippage_bps=self.settings.DECISION_SLIPPAGE_BPS,
+            kelly_fraction=Decimal(str(self.settings.DECISION_KELLY_FRACTION)),
+            quote_age_seconds=quote_age_seconds,
+            max_quote_age_seconds=Decimal(str(self.settings.DECISION_MAX_QUOTE_AGE_SECONDS)),
+            depth_ask_usd_yes=(
+                yes_quote.depth_ask_usd if yes_quote is not None else None
+            ),
+            depth_ask_usd_no=(
+                no_quote.depth_ask_usd if no_quote is not None else None
+            ),
+            min_depth_usd=min_depth_usd,
+            target_order_usd=target_order_usd,
+            fill_complete_yes=yes_walk.complete if yes_walk is not None else False,
+            fill_complete_no=no_walk.complete if no_walk is not None else False,
+            depth_known=order_book.depth_known,
+            resolution_risk_flags=resolution_flags,
+            blocking_resolution_flags=critical_contract_flags,
+            block_on_resolution_risk=strict_crypto,
         )
 
         forecast_id = uuid4()
         now_dt = datetime.now(UTC)
+
+        execution_snapshot = {
+            "observed_at": order_book.observed_at.isoformat(),
+            "quote_age_seconds": str(quote_age_seconds),
+            "ask_yes": str(ask_yes) if ask_yes is not None else None,
+            "ask_no": str(ask_no) if ask_no is not None else None,
+            "spread": str(spread_value) if spread_value is not None else None,
+            "depth_ask_usd_yes": str(yes_quote.depth_ask_usd) if yes_quote is not None else None,
+            "depth_ask_usd_no": str(no_quote.depth_ask_usd) if no_quote is not None else None,
+            "depth_known": order_book.depth_known,
+            "fill_complete_yes": yes_walk.complete if yes_walk is not None else False,
+            "fill_complete_no": no_walk.complete if no_walk is not None else False,
+            "target_order_usd": str(target_order_usd),
+            "taker_fee_rate": str(best_market.taker_fee_rate),
+            "fee_model": best_market.fee_model,
+            "slippage_bps": self.settings.DECISION_SLIPPAGE_BPS,
+            "quote_source": "platform_clob",
+        }
+        input_snapshot = dict(forecast_result.input_snapshot)
+        input_snapshot["execution"] = execution_snapshot
+        input_snapshot["contract_spec_hash"] = contract_spec.spec_hash
+        input_snapshot["contract_tradeable"] = contract_spec.tradeable
+        input_snapshot["resolution_risk_flags"] = resolution_flags
+
+        feature_snapshot = {
+            "category": category,
+            "time_context": specialist_context.get("time_context"),
+            "crypto_research": crypto_research if category == "crypto" else {},
+            "market_microstructure": {
+                "observed_at": order_book.observed_at.isoformat(),
+                "quality_flags": order_book.quality_flags,
+                "depth_known": order_book.depth_known,
+            },
+        }
+        model_components = {
+            "llm_probability": forecast_result.input_snapshot.get("llm_probability"),
+            "math_probability": forecast_result.input_snapshot.get("math_probability"),
+            "market_implied_probability": (
+                float(forecast_result.market_implied_probability)
+                if forecast_result.market_implied_probability is not None
+                else None
+            ),
+            "market_anchor_available": forecast_result.input_snapshot.get(
+                "market_anchor_available"
+            ),
+            "pre_blend_model_probability": forecast_result.input_snapshot.get("model_raw"),
+            "blend_version": forecast_result.input_snapshot.get("blend_version"),
+            "blend_weights": forecast_result.input_snapshot.get("blend_weights"),
+            "component_probabilities": forecast_result.input_snapshot.get(
+                "component_probabilities"
+            ),
+        }
 
         forecast_doc = {
             "id": str(forecast_id),
@@ -572,13 +820,12 @@ class AnalysisWorkflowRunner:
             "forecasted_at": now_dt.isoformat(),
             "forecast_cutoff_at": forecast_cutoff.isoformat(),
             "seconds_to_target": time_to_close,
-            "target_definition": {"question": best_market.title, "outcomes": ["YES", "NO"]},
+            "target_definition": _build_target_definition(best_market, contract_spec),
             "probability_yes": float(forecast_result.probability_yes),
             "probability_no": float(forecast_result.probability_no),
             "uncertainty_interval": [float(x) for x in forecast_result.uncertainty_interval],
             "recommendation": decision.recommendation,
             "decision_metrics": decision.metrics.model_dump(mode="json"),
-            "data_quality": {"flags": order_book.quality_flags},
             "model_version": forecast_result.model_version,
             "calibration_version": forecast_result.calibration_version,
             "prompt_version": forecast_result.prompt_version,
@@ -592,6 +839,19 @@ class AnalysisWorkflowRunner:
             "market": best_market.model_dump(mode="json"),
             "specialist_context": specialist_context,
             "timing_provenance": timing_ctx.to_dict(),
+            "contract_spec": contract_spec.model_dump(mode="json"),
+            "input_snapshot": input_snapshot,
+            "feature_snapshot": feature_snapshot,
+            "model_components": model_components,
+            "data_quality": {
+                "flags": order_book.quality_flags,
+                "quote_age_seconds": float(quote_age_seconds),
+                "depth_known": order_book.depth_known,
+                "contract_ambiguities": [
+                    ambiguity.model_dump(mode="json")
+                    for ambiguity in contract_spec.ambiguities
+                ],
+            },
         }
 
         # 1. Save to SQLite

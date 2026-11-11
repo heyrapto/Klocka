@@ -120,10 +120,43 @@ class Settings(BaseSettings):
     MARKET_MATCH_MIN_MARGIN: float = Field(default=0.06, ge=0.0, le=1.0)
 
     # ------------------------------------------------------------------
+    # External market-data transport
+    # ------------------------------------------------------------------
+    # The system resolver is always tried first.  DoH is a fallback for
+    # networks where DNS for financial APIs is filtered, broken, or slow.
+    MARKET_DATA_DNS_FALLBACK_ENABLED: bool = True
+    # IP-literal endpoints avoid a DNS bootstrap loop when the system resolver
+    # is the component that has failed.  Hostname endpoints may be added when a
+    # deployment requires them (and can already resolve their own hostnames).
+    MARKET_DATA_DOH_ENDPOINTS: str = (
+        "https://1.1.1.1/dns-query,"
+        "https://8.8.8.8/resolve"
+    )
+    MARKET_DATA_DNS_SYSTEM_TIMEOUT_SECONDS: float = Field(default=0.8, gt=0.0, le=10.0)
+    MARKET_DATA_DNS_DOH_TIMEOUT_SECONDS: float = Field(default=2.5, gt=0.0, le=10.0)
+    MARKET_DATA_DNS_CACHE_TTL_SECONDS: int = Field(default=300, ge=30, le=3600)
+    MARKET_DATA_DNS_NEGATIVE_CACHE_SECONDS: int = Field(default=30, ge=5, le=300)
+    MARKET_DATA_CONNECT_TIMEOUT_SECONDS: float = Field(default=4.0, gt=0.0, le=30.0)
+    MARKET_DATA_READ_TIMEOUT_SECONDS: float = Field(default=8.0, gt=0.0, le=60.0)
+    MARKET_DATA_GROUP_BUDGET_SECONDS: float = Field(default=10.0, gt=0.0, le=60.0)
+
+    # ------------------------------------------------------------------
     # Forecasting
     # ------------------------------------------------------------------
     FORECAST_MODEL_VERSION: str = "market_baseline_v1"
     FORECAST_MAX_INTERVAL_HALF_WIDTH: float = Field(default=0.25, gt=0.0, le=0.5)
+    FORECAST_BLEND_VERSION: str = "linear_normalized_v2"
+    # Crypto contracts have a grounded mathematical anchor.  The market remains
+    # the largest single component because the crowd is a strong calibrated
+    # baseline; the LLM is deliberately a small complement.
+    FORECAST_CRYPTO_MATH_WEIGHT: float = Field(default=0.40, ge=0.0, le=1.0)
+    FORECAST_CRYPTO_LLM_WEIGHT: float = Field(default=0.10, ge=0.0, le=1.0)
+    FORECAST_CRYPTO_MARKET_WEIGHT: float = Field(default=0.50, ge=0.0, le=1.0)
+    FORECAST_GENERAL_LLM_WEIGHT: float = Field(default=0.35, ge=0.0, le=1.0)
+    FORECAST_GENERAL_MARKET_WEIGHT: float = Field(default=0.65, ge=0.0, le=1.0)
+    # When true, crypto contracts with unresolved oracle/comparator/strike
+    # semantics are blocked at the decision layer instead of being traded.
+    CONTRACT_SPEC_STRICT_CRYPTO: bool = True
     RESEARCH_ENABLED: bool = False
 
     # ------------------------------------------------------------------
@@ -204,6 +237,25 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "Supabase storage needs SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY."
                 )
+
+        crypto_total = (
+            self.FORECAST_CRYPTO_MATH_WEIGHT
+            + self.FORECAST_CRYPTO_LLM_WEIGHT
+            + self.FORECAST_CRYPTO_MARKET_WEIGHT
+        )
+        if abs(crypto_total - 1.0) > 1e-9:
+            raise ValueError(
+                "FORECAST_CRYPTO_* weights must sum to 1.0 "
+                f"(got {crypto_total:.6f})."
+            )
+        general_total = (
+            self.FORECAST_GENERAL_LLM_WEIGHT + self.FORECAST_GENERAL_MARKET_WEIGHT
+        )
+        if abs(general_total - 1.0) > 1e-9:
+            raise ValueError(
+                "FORECAST_GENERAL_* weights must sum to 1.0 "
+                f"(got {general_total:.6f})."
+            )
         return self
 
 

@@ -16,15 +16,48 @@ class BaselineForecaster:
         market: NormalizedMarket,
         order_book: NormalizedOrderBook,
     ) -> ForecastResult:
-        # 1. Compute market implied price from quotes
-        yes_quote = next((q for q in order_book.quotes if q.label.lower() in ("yes", "yes ")), None)
-        if yes_quote is None and order_book.quotes:
-            yes_quote = order_book.quotes[0]
+        # 1. Compute market implied price from quotes.  A missing quote is not
+        # a neutral 0.50 prior: this baseline is a market model and cannot
+        # produce a probability without an executable market reference.
+        yes_quote = next(
+            (q for q in order_book.quotes if q.label.strip().lower() == "yes"),
+            None,
+        )
+        if yes_quote is None:
+            yes_quote = next(
+                (
+                    q
+                    for q in order_book.quotes
+                    if q.label.strip().lower()
+                    in {"up", "higher", "over", "above", "buy up", "buy yes"}
+                ),
+                None,
+            )
 
-        if yes_quote and yes_quote.mid_price is not None:
-            p_implied = yes_quote.mid_price
+        if yes_quote is not None and yes_quote.mid_price is not None:
+            if Decimal("0") < yes_quote.mid_price < Decimal("1"):
+                p_implied = yes_quote.mid_price
+            else:
+                raise ValueError(
+                    "Baseline forecaster requires a market mid-price strictly "
+                    "between 0 and 1; the platform returned an endpoint quote."
+                )
+        elif (
+            yes_quote is not None
+            and yes_quote.best_bid is not None
+            and yes_quote.best_ask is not None
+        ):
+            p_implied = (yes_quote.best_bid + yes_quote.best_ask) / Decimal("2")
+            if p_implied <= 0 or p_implied >= 1:
+                raise ValueError(
+                    "Baseline forecaster requires a market midpoint strictly "
+                    "between 0 and 1; the platform returned an endpoint quote."
+                )
         else:
-            p_implied = Decimal("0.50")
+            raise ValueError(
+                "Baseline forecaster requires an executable market quote for the "
+                "affirmative outcome; no 0.50 substitute is used."
+            )
 
         # 2. Compute order book imbalance adjustment
         bid_depth = yes_quote.depth_bid_usd if yes_quote else Decimal("0")

@@ -1,25 +1,39 @@
 """Automated settlement resolver for crypto prediction market intervals.
 
-Fetches closing spot price at resolution time from Binance or Coinbase and determines
-whether the contract resolved YES or NO based on strike price and direction.
+Resolves the spot price at contract expiry and determines whether the contract
+resolved YES/NO (or UP/DOWN) from the strike price and direction.
+
+Settlement rules
+----------------
+* If ``target_time`` is in the past, only a timestamp-validated historical
+  candle is accepted.  A live price is never substituted for a historical
+  settlement when the target is materially older than the current instant,
+  because that would silently settle the contract at the wrong time.
+* If the target is within a short grace window (or absent/future), the live
+  cross-venue spot mesh is used.
+* If every venue fails, ``None`` is returned so the API can answer with an
+  explicit error and preserve the manual settlement workflow.  A price is never
+  fabricated from the strike.
+
+The exchange mesh lives in :mod:`prediction_ai.specialists.crypto.venues`; this
+module only applies the settlement-specific time policy.
 """
 
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Any
 
 import httpx
 import structlog
 
-logger = structlog.get_logger(__name__)
+from prediction_ai.core.config import Settings, get_settings
+from prediction_ai.integrations.network import build_resilient_client
+from prediction_ai.specialists.crypto.venues import (
+    fetch_historical_spot,
+    fetch_spot_snapshot,
+)
 
-_BINANCE_SPOT = "https://api.binance.com"
-_BINANCE_US = "https://api.binance.us"
-_OKX = "https://www.okx.com"
-_BYBIT = "https://api.bybit.com"
-_COINBASE_API = "https://api.coinbase.com"
-_TIMEOUT = httpx.Timeout(6.0, connect=3.0)
+logger = structlog.get_logger(__name__)
 
 _SYMBOL_MAP: dict[str, str] = {
     "btc": "BTC",
@@ -41,9 +55,13 @@ _SYMBOL_MAP: dict[str, str] = {
     "chainlink": "LINK",
 }
 
+# A target this recent can reasonably use the current live price when the
+# historical candle provider is unavailable.  Older targets must abstain.
+_LIVE_FALLBACK_GRACE_SECONDS = 1800.0
+
 
 def normalize_crypto_symbol(symbol_or_name: str | None) -> str:
-    """Normalize input asset string to a clean uppercase ticker (e.g. 'BTC')."""
+    """Normalize an input asset string to a clean uppercase ticker (e.g. 'BTC')."""
     if not symbol_or_name:
         return "BTC"
     cleaned = symbol_or_name.strip().lower()
@@ -54,137 +72,88 @@ async def fetch_crypto_settlement_price(
     symbol: str,
     target_time: datetime | None = None,
     client: httpx.AsyncClient | None = None,
+    settings: Settings | None = None,
 ) -> float | None:
-    """
-    Fetch the spot price for a crypto asset around resolution time.
+    """Fetch a verified spot price for a crypto contract's resolution time.
 
-    Attempts:
-    1. Binance 1-minute klines around target_time (if target_time is in the past).
-    2. Binance live ticker price.
-    3. Coinbase spot price fallback.
+    The same resilient DNS/DoH transport and multi-venue mesh used by research
+    is used here, so settlement cannot fail merely because the system resolver
+    blocks exchange domains.
     """
     norm_symbol = normalize_crypto_symbol(symbol)
-    pair = f"{norm_symbol}USDT"
-    local_client = client or httpx.AsyncClient(timeout=_TIMEOUT)
+    resolved_settings = settings or get_settings()
+    budget = resolved_settings.MARKET_DATA_GROUP_BUDGET_SECONDS
+    owns_client = client is None
+    local_client = client or build_resilient_client(resolved_settings)
 
     try:
-        # 1. Historical 1m kline if target_time is specified
         if target_time is not None:
-            now_dt = datetime.now(UTC)
-            if target_time <= now_dt:
-                target_ms = int(target_time.timestamp() * 1000)
-                start_ms = target_ms - 60_000
-                end_ms = target_ms + 60_000
-                try:
-                    resp = await local_client.get(
-                        f"{_BINANCE_SPOT}/api/v3/klines",
-                        params={
-                            "symbol": pair,
-                            "interval": "1m",
-                            "startTime": start_ms,
-                            "endTime": end_ms,
-                            "limit": 5,
-                        },
+            if target_time.tzinfo is None:
+                target_time = target_time.replace(tzinfo=UTC)
+            target_time = target_time.astimezone(UTC)
+            age_seconds = (datetime.now(UTC) - target_time).total_seconds()
+
+            if age_seconds >= 0:
+                historical = await fetch_historical_spot(
+                    local_client,
+                    norm_symbol,
+                    target_time,
+                    budget_seconds=budget,
+                )
+                if historical is not None:
+                    logger.info(
+                        "Resolved historical settlement price",
+                        symbol=norm_symbol,
+                        target_time=target_time.isoformat(),
+                        settlement_price=historical.price,
+                        observed_at=historical.observed_at.isoformat(),
+                        source=historical.venue,
                     )
-                    if resp.status_code == 200:
-                        klines = resp.json()
-                        if isinstance(klines, list) and klines:
-                            # Kline structure: [open_time, open, high, low, close, volume, close_time, ...]
-                            # Pick kline closest to target_ms
-                            best_kline = min(
-                                klines,
-                                key=lambda k: abs(int(k[6]) - target_ms),
-                            )
-                            close_price = float(best_kline[4])
-                            logger.info(
-                                "Resolved historical settlement price via Binance 1m kline",
-                                symbol=norm_symbol,
-                                target_time=target_time.isoformat(),
-                                settlement_price=close_price,
-                            )
-                            return close_price
-                except Exception as ex:
-                    logger.debug("Binance klines fetch failed, falling back to ticker", error=str(ex))
+                    return historical.price
 
-        # 2. Binance Global Spot live ticker
-        try:
-            resp = await local_client.get(
-                f"{_BINANCE_SPOT}/api/v3/ticker/price",
-                params={"symbol": pair},
+                if age_seconds > _LIVE_FALLBACK_GRACE_SECONDS:
+                    logger.warning(
+                        "Historical settlement price unavailable; refusing to substitute "
+                        "a much-later live price",
+                        symbol=norm_symbol,
+                        target_time=target_time.isoformat(),
+                        age_seconds=round(age_seconds, 1),
+                        grace_seconds=_LIVE_FALLBACK_GRACE_SECONDS,
+                    )
+                    return None
+
+                logger.warning(
+                    "Historical settlement price unavailable; target is within the "
+                    "live fallback grace window",
+                    symbol=norm_symbol,
+                    target_time=target_time.isoformat(),
+                    age_seconds=round(age_seconds, 1),
+                )
+
+        spot = await fetch_spot_snapshot(
+            local_client,
+            norm_symbol,
+            budget_seconds=budget,
+        )
+        if spot is not None and spot.price > 0:
+            logger.info(
+                "Resolved settlement price from live cross-venue spot mesh",
+                symbol=norm_symbol,
+                price=spot.price,
+                source=spot.source,
+                venues=[quote.venue for quote in spot.quotes],
+                dispersion_bps=round(spot.dispersion_bps, 2),
             )
-            if resp.status_code == 200:
-                data = resp.json()
-                if isinstance(data, dict) and "price" in data:
-                    price = float(data["price"])
-                    logger.info("Resolved settlement price via Binance Global ticker", symbol=norm_symbol, price=price)
-                    return price
-        except Exception:
-            pass
+            return spot.price
 
-        # 3. Binance US live ticker
-        try:
-            resp = await local_client.get(
-                f"{_BINANCE_US}/api/v3/ticker/price",
-                params={"symbol": pair},
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                if isinstance(data, dict) and "price" in data:
-                    price = float(data["price"])
-                    logger.info("Resolved settlement price via Binance US ticker", symbol=norm_symbol, price=price)
-                    return price
-        except Exception:
-            pass
-
-        # 4. OKX Spot ticker
-        try:
-            resp = await local_client.get(
-                f"{_OKX}/api/v5/market/ticker",
-                params={"instId": f"{norm_symbol}-USDT"},
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                if isinstance(data, dict) and data.get("data"):
-                    price = float(data["data"][0]["last"])
-                    logger.info("Resolved settlement price via OKX ticker", symbol=norm_symbol, price=price)
-                    return price
-        except Exception:
-            pass
-
-        # 5. Bybit Spot ticker
-        try:
-            resp = await local_client.get(
-                f"{_BYBIT}/v5/market/tickers",
-                params={"category": "spot", "symbol": pair},
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                items = data.get("result", {}).get("list", [])
-                if items:
-                    price = float(items[0]["lastPrice"])
-                    logger.info("Resolved settlement price via Bybit ticker", symbol=norm_symbol, price=price)
-                    return price
-        except Exception:
-            pass
-
-        # 6. Coinbase spot fallback
-        try:
-            resp = await local_client.get(
-                f"{_COINBASE_API}/v2/prices/{norm_symbol}-USD/spot"
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                amount_str = data.get("data", {}).get("amount")
-                if amount_str:
-                    price = float(amount_str)
-                    logger.info("Resolved settlement price via Coinbase spot", symbol=norm_symbol, price=price)
-                    return price
-        except Exception as ex:
-            logger.warning("Coinbase spot fetch failed", error=str(ex))
-
+        logger.warning(
+            "All settlement price venues failed",
+            symbol=norm_symbol,
+            target_time=target_time.isoformat() if target_time else None,
+        )
         return None
     finally:
-        if client is None:
+        if owns_client:
             await local_client.aclose()
 
 
@@ -195,8 +164,7 @@ def determine_binary_outcome(
     label_positive: str = "YES",
     label_negative: str = "NO",
 ) -> str:
-    """
-    Determine whether the binary market resolved positive (YES/UP) or negative (NO/DOWN).
+    """Determine whether a binary market resolved positive or negative.
 
     Args:
         strike_price: Contract target price K.

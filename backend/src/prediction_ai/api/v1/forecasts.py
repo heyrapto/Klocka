@@ -3,7 +3,9 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
+import structlog
 from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -13,10 +15,28 @@ from prediction_ai.db.models.forecast import Forecast, ForecastEvidence
 from prediction_ai.db.models.market import PredictionMarket
 from prediction_ai.db.mongo import MongoDBStore
 from prediction_ai.db.sqlite import SQLiteStore
+from prediction_ai.schemas.contract import ContractSpec
 from prediction_ai.schemas.forecast import EvidenceItem, ForecastResponse, MarketSummary
 from prediction_ai.schemas.market import NormalizedOutcome
 
 router = APIRouter(prefix="/forecasts", tags=["Forecasts"])
+
+logger = structlog.get_logger(__name__)
+
+
+def _stored_contract_spec(payload: Any, forecast_id: uuid.UUID) -> ContractSpec | None:
+    """Parse a persisted contract spec, logging malformed snapshots explicitly."""
+    if not isinstance(payload, dict) or not payload:
+        return None
+    try:
+        return ContractSpec.model_validate(payload)
+    except ValidationError as error:
+        logger.warning(
+            "Stored contract specification failed validation",
+            forecast_id=str(forecast_id),
+            error=str(error),
+        )
+        return None
 
 
 @router.get("/{forecast_id}", response_model=ForecastResponse)
@@ -59,7 +79,7 @@ async def get_forecast(
                 evidence_id=str(ev.get("evidence_id") or uuid.uuid4()),
                 evidence_type=ev.get("evidence_type", "MICROSTRUCTURE"),
                 stance=ev.get("stance", "NEUTRAL"),
-                relevance_score=float(ev.get("relevance_score", 0.5)),
+                relevance_score=Decimal(str(ev.get("relevance_score", 0.5))),
                 snippet=ev.get("snippet", ""),
                 source_citation=ev.get("source_citation", ""),
                 source_url=ev.get("source_url"),
@@ -75,8 +95,8 @@ async def get_forecast(
             probability_yes=Decimal(str(f_doc.get("probability_yes", 0.5))),
             probability_no=Decimal(str(f_doc.get("probability_no", 0.5))),
             uncertainty_interval=[Decimal(str(x)) for x in f_doc.get("uncertainty_interval", [0.4, 0.6])],
-            recommendation=f_doc.get("recommendation", "NO_TRADE"),  # type: ignore[arg-type]
-            decision_metrics=f_doc.get("decision_metrics", {}),  # type: ignore[arg-type]
+            recommendation=f_doc.get("recommendation", "NO_TRADE"),
+            decision_metrics=f_doc.get("decision_metrics", {}),
             data_quality=f_doc.get("data_quality", {}),
             model_version=f_doc.get("model_version", "v1"),
             calibration_version=f_doc.get("calibration_version", "v1"),
@@ -85,6 +105,9 @@ async def get_forecast(
             explanation=f_doc.get("explanation", {}),
             evidence=evidence_items,
             input_snapshot=f_doc.get("input_snapshot", {}),
+            contract_spec=_stored_contract_spec(f_doc.get("contract_spec"), forecast_id),
+            feature_snapshot=f_doc.get("feature_snapshot") or {},
+            model_components=f_doc.get("model_components") or {},
         )
 
     # 2. Check SQL database if available
