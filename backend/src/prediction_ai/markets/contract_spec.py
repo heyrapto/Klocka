@@ -138,6 +138,18 @@ def _split_outcomes(
     )
 
 
+def resolve_contract_direction(market: NormalizedMarket) -> ContractDirection:
+    """Return the direction implied by the market's authoritative metadata.
+
+    The platform's outcome labels and title take precedence over screenshot
+    free text.  Callers that need a direction before building the full
+    :class:`ContractSpec` (for example, crypto research) should use this helper
+    rather than re-parsing the title.
+    """
+    labels = [_normalise_label(item.label) for item in market.outcomes]
+    return _parse_direction(market.title, labels)
+
+
 def _parse_direction(title: str, labels: list[str]) -> ContractDirection:
     text = " ".join([title, *labels]).lower()
     if "up or down" in text:

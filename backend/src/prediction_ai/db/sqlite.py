@@ -9,6 +9,10 @@ import anyio
 import structlog
 
 from prediction_ai.core.config import Settings, get_settings
+from prediction_ai.schemas.price_history import (
+    MAX_HISTORY_POINTS,
+    OutcomePriceHistory,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -151,6 +155,27 @@ class SQLiteStore:
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY (symbol, category)
             );
+
+            CREATE TABLE IF NOT EXISTS market_price_history (
+                platform TEXT NOT NULL,
+                platform_market_id TEXT NOT NULL,
+                outcome_id TEXT NOT NULL,
+                token_id TEXT NOT NULL,
+                label TEXT,
+                observed_at TEXT NOT NULL,
+                price TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                source TEXT NOT NULL,
+                granularity_seconds INTEGER NOT NULL DEFAULT 60,
+                ingested_at TEXT NOT NULL,
+                PRIMARY KEY (
+                    platform, platform_market_id, outcome_id, observed_at, source
+                )
+            );
+            CREATE INDEX IF NOT EXISTS idx_price_history_lookup
+                ON market_price_history(
+                    platform, platform_market_id, outcome_id, observed_at
+                );
             """)
 
             # Add supplemental columns if feedback table was created by an older migration
@@ -775,14 +800,19 @@ class SQLiteStore:
         order_flow_weight_delta: float = 0.0,
         uncertainty_margin_delta: float = 0.0,
         reason: str | None = None,
+        was_trade: bool = True,
     ) -> dict[str, Any]:
         sym = symbol.upper()
         cat = category.lower()
         now = datetime.now(UTC).isoformat()
         current = self._get_asset_calibration_sync(sym, cat)
 
-        n = current["sample_count"] + 1
-        corrects = current["correct_count"] + (1 if was_correct else 0)
+        # ``sample_count``/``correct_count`` describe executed recommendations
+        # only.  An abstention's probability is still a valid Brier sample, but
+        # its directional lean is not a trade outcome and must not inflate the
+        # win rate.
+        n = current["sample_count"] + (1 if was_trade else 0)
+        corrects = current["correct_count"] + (1 if was_trade and was_correct else 0)
         # Exponential moving average for Brier score (alpha = 0.2)
         alpha = 0.2 if current["sample_count"] > 0 else 1.0
         new_brier = (1.0 - alpha) * current["brier_score"] + alpha * brier_loss
@@ -831,12 +861,13 @@ class SQLiteStore:
         order_flow_weight_delta: float = 0.0,
         uncertainty_margin_delta: float = 0.0,
         reason: str | None = None,
+        was_trade: bool = True,
     ) -> dict[str, Any]:
         return await anyio.to_thread.run_sync(
             self._update_asset_calibration_sync,
             symbol, category, was_correct, brier_loss,
             vol_multiplier_delta, momentum_weight_delta,
-            order_flow_weight_delta, uncertainty_margin_delta, reason,
+            order_flow_weight_delta, uncertainty_margin_delta, reason, was_trade,
         )
 
     def _list_asset_calibrations_sync(self, category: str | None = None) -> list[dict[str, Any]]:
@@ -854,6 +885,157 @@ class SQLiteStore:
 
     async def list_asset_calibrations(self, category: str | None = None) -> list[dict[str, Any]]:
         return await anyio.to_thread.run_sync(self._list_asset_calibrations_sync, category)
+
+    # ------------------------------------------------------------------
+    # Historical market prices
+    # ------------------------------------------------------------------
+    def _record_price_histories_sync(self, histories: list[OutcomePriceHistory]) -> int:
+        rows: list[tuple[Any, ...]] = []
+        ingested_at = datetime.now(UTC).isoformat()
+        for history in histories:
+            for point in history.points:
+                rows.append(
+                    (
+                        history.platform,
+                        history.platform_market_id,
+                        history.outcome_id,
+                        history.token_id,
+                        history.label,
+                        point.observed_at.isoformat(),
+                        str(point.price),
+                        point.kind,
+                        point.source,
+                        history.granularity_seconds,
+                        ingested_at,
+                    )
+                )
+        if not rows:
+            return 0
+        with self._get_connection() as conn:
+            before = conn.total_changes
+            conn.executemany(
+                """
+                INSERT OR IGNORE INTO market_price_history (
+                    platform, platform_market_id, outcome_id, token_id, label,
+                    observed_at, price, kind, source, granularity_seconds, ingested_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+            return conn.total_changes - before
+
+    async def record_price_histories(self, histories: list[OutcomePriceHistory]) -> int:
+        """Persist price points idempotently; returns the inserted row count."""
+        return await anyio.to_thread.run_sync(self._record_price_histories_sync, histories)
+
+    async def record_price_history(self, history: OutcomePriceHistory) -> int:
+        return await self.record_price_histories([history])
+
+    def _get_price_history_sync(
+        self,
+        platform: str,
+        platform_market_id: str,
+        outcome_id: str,
+        *,
+        start: str | None,
+        end: str | None,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        if not 1 <= limit <= MAX_HISTORY_POINTS:
+            raise ValueError(f"limit must be between 1 and {MAX_HISTORY_POINTS}")
+        conditions = [
+            "platform = ?",
+            "platform_market_id = ?",
+            "outcome_id = ?",
+        ]
+        params: list[Any] = [platform, platform_market_id, outcome_id]
+        if start is not None:
+            conditions.append("observed_at >= ?")
+            params.append(start)
+        if end is not None:
+            conditions.append("observed_at <= ?")
+            params.append(end)
+        params.append(limit)
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                f"""
+                SELECT platform, platform_market_id, outcome_id, token_id, label,
+                       observed_at, price, kind, source, granularity_seconds,
+                       ingested_at
+                FROM market_price_history
+                WHERE {' AND '.join(conditions)}
+                ORDER BY observed_at ASC, source ASC
+                LIMIT ?
+                """,
+                params,
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    async def get_price_history(
+        self,
+        platform: str,
+        platform_market_id: str,
+        outcome_id: str,
+        *,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        """Return a bounded, ascending price path for one outcome."""
+        return await anyio.to_thread.run_sync(
+            self._get_price_history_sync,
+            platform,
+            platform_market_id,
+            outcome_id,
+            start=start.isoformat() if start is not None else None,
+            end=end.isoformat() if end is not None else None,
+            limit=limit,
+        )
+
+    def _get_latest_price_before_sync(
+        self,
+        platform: str,
+        platform_market_id: str,
+        outcome_id: str,
+        cutoff: str,
+    ) -> dict[str, Any] | None:
+        with self._get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT platform, platform_market_id, outcome_id, token_id, label,
+                       observed_at, price, kind, source, granularity_seconds,
+                       ingested_at
+                FROM market_price_history
+                WHERE platform = ?
+                  AND platform_market_id = ?
+                  AND outcome_id = ?
+                  AND observed_at <= ?
+                ORDER BY observed_at DESC, source ASC
+                LIMIT 1
+                """,
+                (platform, platform_market_id, outcome_id, cutoff),
+            ).fetchone()
+            if row is None:
+                return None
+            result = dict(row)
+            result["price"] = Decimal(str(result["price"]))
+            return result
+
+    async def get_latest_price_before(
+        self,
+        platform: str,
+        platform_market_id: str,
+        outcome_id: str,
+        cutoff: datetime,
+    ) -> dict[str, Any] | None:
+        """Return the most recent price at or before ``cutoff`` (look-ahead safe)."""
+        return await anyio.to_thread.run_sync(
+            self._get_latest_price_before_sync,
+            platform,
+            platform_market_id,
+            outcome_id,
+            cutoff.isoformat(),
+        )
 
 
 _sqlite_store: SQLiteStore | None = None

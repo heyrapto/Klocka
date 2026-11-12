@@ -20,7 +20,7 @@ from prediction_ai.integrations.bayse import BayseAdapter
 from prediction_ai.integrations.http import ProviderHttpClient
 from prediction_ai.integrations.network import build_resilient_client
 from prediction_ai.integrations.polymarket import PolymarketAdapter
-from prediction_ai.markets.contract_spec import build_contract_spec
+from prediction_ai.markets.contract_spec import build_contract_spec, resolve_contract_direction
 from prediction_ai.markets.matcher import match_candidate_to_platform_market
 from prediction_ai.markets.quote_mapping import find_outcome_quote as _find_outcome_quote
 from prediction_ai.orchestration.events import EventRecorder
@@ -533,6 +533,18 @@ class AnalysisWorkflowRunner:
         category = best_market.category
         target_price_float = float(candidate.target_price) if candidate.target_price is not None else None
         displayed_price_float = float(candidate.displayed_underlying_price) if candidate.displayed_underlying_price is not None else None
+
+        # Direction is taken from the platform's own outcome labels/title, not
+        # from screenshot free text.  A title like "Bitcoin Up or Down" must
+        # never be interpreted as a below-threshold contract.
+        crypto_direction: str | None = None
+        if category == "crypto":
+            contract_direction = resolve_contract_direction(best_market)
+            if contract_direction in ("up", "above"):
+                crypto_direction = "above"
+            elif contract_direction in ("down", "below"):
+                crypto_direction = "below"
+
         specialist_context = await specialist_service.gather_context(
             category=category,
             asset=best_market.underlying_symbol or candidate.asset_or_entity,
@@ -540,6 +552,7 @@ class AnalysisWorkflowRunner:
             time_to_close_seconds=time_to_close,
             target_price=target_price_float,
             displayed_underlying_price=displayed_price_float,
+            direction=crypto_direction,
         )
 
         screenshot_observation = candidate.model_dump(

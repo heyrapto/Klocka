@@ -116,6 +116,7 @@ class ClaimModality(StrEnum):
 
 class EpistemicState(StrEnum):
     ASSERTED = "asserted"
+    OFFICIAL_STATEMENT = "official_statement"
     DENIED = "denied"
     SPECULATED = "speculated"
     CONDITIONAL = "conditional"

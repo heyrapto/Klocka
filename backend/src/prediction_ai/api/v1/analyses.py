@@ -737,6 +737,7 @@ async def submit_analysis_feedback(
             order_flow_weight_delta=postmortem.order_flow_weight_delta,
             uncertainty_margin_delta=postmortem.uncertainty_margin_delta,
             reason=postmortem.discrepancy_classification,
+            was_trade=recommendation != "NO_TRADE",
         )
 
     logger.info(
@@ -946,6 +947,7 @@ async def auto_settle_analysis(
             order_flow_weight_delta=postmortem.order_flow_weight_delta,
             uncertainty_margin_delta=postmortem.uncertainty_margin_delta,
             reason=postmortem.discrepancy_classification,
+            was_trade=recommendation != "NO_TRADE",
         )
 
     logger.info(

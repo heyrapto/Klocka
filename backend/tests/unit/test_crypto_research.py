@@ -182,6 +182,83 @@ async def test_missing_spot_returns_data_unavailable_not_a_fabricated_price(
     assert "SPOT_PRICE_UNAVAILABLE" in context["data_quality_flags"]
 
 
+def test_up_or_down_title_is_not_parsed_as_below() -> None:
+    """Regression: "Up or Down" is an orientation-agnostic interval contract.
+
+    The word "Down" in the title used to flip the direction to "below", which
+    inverted the model probability for every Bayse 15-minute BTC market.
+    """
+    strike, direction = research._parse_strike_and_direction(
+        "Bitcoin Up or Down - 15 minutes?"
+    )
+    assert strike is None
+    assert direction == "above"
+
+
+def test_explicit_below_title_still_parses_below() -> None:
+    strike, direction = research._parse_strike_and_direction(
+        "Will BTC be below 74000 in 15 minutes?"
+    )
+    assert strike == pytest.approx(74000.0)
+    assert direction == "below"
+
+
+def test_direction_hint_overrides_ambiguous_title() -> None:
+    _, direction = research._parse_strike_and_direction(
+        "Bitcoin Up or Down - 15 minutes?", "below"
+    )
+    assert direction == "below"
+
+
+def test_down_to_phrase_still_parses_below() -> None:
+    _, direction = research._parse_strike_and_direction("Will BTC trade down to 70000?")
+    assert direction == "below"
+
+
+@pytest.mark.asyncio
+async def test_up_or_down_market_is_not_probability_inverted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def spot(
+        client: httpx.AsyncClient, symbol: str, **kwargs: Any
+    ) -> SpotSnapshot:
+        del client, symbol, kwargs
+        observed_at = datetime.now(UTC)
+        return SpotSnapshot(
+            price=73_000.0,
+            source="Test venue",
+            quotes=(SpotQuote(price=73_000.0, venue="Test venue", observed_at=observed_at),),
+            dispersion_bps=0.0,
+        )
+
+    monkeypatch.setattr(research, "fetch_spot_snapshot", spot)
+    monkeypatch.setattr(research, "fetch_ohlcv_snapshot", _no_fetch)
+    monkeypatch.setattr(research, "fetch_order_book_snapshot", _no_fetch)
+    monkeypatch.setattr(research, "fetch_derivatives_snapshot", _no_fetch)
+    monkeypatch.setattr(research, "fetch_fear_and_greed", _no_fetch)
+    monkeypatch.setattr(research, "_load_vol_multiplier", _one_multiplier)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200))
+    ) as client:
+        context = await research.gather_crypto_intelligence(
+            "Bitcoin Up or Down - 15 minutes?",
+            underlying_symbol="BTC",
+            target_price=73_000.0,
+            direction="above",
+            http_client=client,
+            settings=_test_settings(),
+        )
+
+    assert context["direction"] == "above"
+    assert float(context["final_adjusted_prob_yes"]) == pytest.approx(
+        float(context["adjusted_prob_yes"]), abs=1e-4
+    )
+    assert not any(
+        "probability inverted" in signal for signal in context["key_signals"]
+    )
+
+
 def test_build_features_har_vol_blend_and_ofi() -> None:
     from prediction_ai.specialists.crypto.features import build_features
 

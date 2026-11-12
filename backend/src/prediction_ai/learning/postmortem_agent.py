@@ -134,6 +134,11 @@ async def run_postmortem_analysis(
         )
 
     is_abstention = recommendation == "NO_TRADE"
+    # Abstentions remain evaluation-eligible: the probability they assigned is
+    # still a valid calibration sample.  They are passed to the calibration
+    # store with ``was_trade=False`` so their directional lean is never counted
+    # as a winning trade in the user-facing win rate.
+    evaluation_eligible = True
 
     was_correct = False
     if recommendation in ("BUY_YES", "BUY_UP") and is_affirmative_outcome:
@@ -201,7 +206,7 @@ async def run_postmortem_analysis(
                 parsed = PostmortemOutputSchema.model_validate_json(clean)
                 return PostmortemResult(
                     was_correct=was_correct,
-                    evaluation_eligible=True,
+                    evaluation_eligible=evaluation_eligible,
                     brier_loss=brier_loss,
                     discrepancy_classification=parsed.discrepancy_classification,
                     postmortem_analysis=parsed.postmortem_analysis,
@@ -230,6 +235,7 @@ async def run_postmortem_analysis(
         specialist_context=specialist_context,
         user_notes=user_notes,
         visual_observations=visual_obs,
+        evaluation_eligible=evaluation_eligible,
     )
 
 
@@ -382,7 +388,7 @@ def _heuristic_postmortem(
 
         return PostmortemResult(
             was_correct=is_aligned_lean,
-            evaluation_eligible=True,
+            evaluation_eligible=evaluation_eligible,
             brier_loss=brier_loss,
             discrepancy_classification=classification,
             postmortem_analysis=analysis,
@@ -397,7 +403,7 @@ def _heuristic_postmortem(
     if was_correct:
         return PostmortemResult(
             was_correct=True,
-            evaluation_eligible=True,
+            evaluation_eligible=evaluation_eligible,
             brier_loss=brier_loss,
             discrepancy_classification="ACCURATE_CONVICTION",
             postmortem_analysis=(
@@ -496,7 +502,7 @@ def _heuristic_postmortem(
 
     return PostmortemResult(
         was_correct=False,
-        evaluation_eligible=True,
+        evaluation_eligible=evaluation_eligible,
         brier_loss=brier_loss,
         discrepancy_classification=classification,
         postmortem_analysis=analysis,

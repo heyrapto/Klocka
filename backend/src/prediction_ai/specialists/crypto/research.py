@@ -116,22 +116,54 @@ def _infer_symbol(title: str, hint: str | None = None) -> str:
     return "BTC"
 
 
-def _parse_strike_and_direction(title: str) -> tuple[float | None, str]:
+_BELOW_TOKENS = (
+    "below",
+    "less than",
+    "under",
+    "lower than",
+    "sub-",
+    "drop to",
+    "drops to",
+    "down to",
+)
+
+
+def _contains_token(text: str, tokens: tuple[str, ...]) -> bool:
+    """Return True when any token appears as a standalone phrase in ``text``."""
+    for token in tokens:
+        if re.search(rf"(?<![a-z]){re.escape(token)}(?![a-z])", text):
+            return True
+    return False
+
+
+def _parse_strike_and_direction(
+    title: str,
+    direction: str | None = None,
+) -> tuple[float | None, str]:
     """Extract the strike price and comparison direction from a market title.
 
-    Returns ``(strike_price, direction)`` where direction is ``"above"``,
-    ``"below"``, or ``"unknown"``.
+    Returns ``(strike_price, direction)`` where direction is ``"above"`` or
+    ``"below"``.  ``direction`` (when supplied) is authoritative: the market's
+    own outcome labels and contract spec take precedence over free-text title
+    parsing.
+
+    Titles such as ``"Bitcoin Up or Down - 15 minutes?"`` are orientation
+    agnostic: the affirmative outcome is ``Up``, i.e. the settlement price is
+    compared *above* the interval's opening strike.  Treating the trailing word
+    ``"Down"`` as a below-threshold contract inverts the probability and was a
+    production bug.
     """
     title_norm = title.replace(",", "").replace("$", "").lower()
 
-    direction = "above"
-    if any(w in title_norm for w in ["below", "less than", "under", "sub-", "drop to", "down"]):
-        direction = "below"
-    elif any(
-        w in title_norm
-        for w in ["above", "greater than", "over", "reach", "hit", "surpass", "up"]
-    ):
-        direction = "above"
+    if direction in ("above", "below"):
+        resolved_direction = direction
+    elif "up or down" in title_norm or "higher or lower" in title_norm:
+        resolved_direction = "above"
+    elif _contains_token(title_norm, _BELOW_TOKENS):
+        resolved_direction = "below"
+    else:
+        resolved_direction = "above"
+    direction = resolved_direction
 
     patterns = [
         r"(?:above|below|reach|hit|over|under|at|to)\s+(\d+(?:\.\d+)?)\s*k\b",
@@ -437,6 +469,7 @@ async def gather_crypto_intelligence(
     underlying_symbol: str | None = None,
     target_price: float | None = None,
     displayed_spot_price: float | None = None,
+    direction: str | None = None,
     http_client: httpx.AsyncClient | None = None,
     settings: Settings | None = None,
 ) -> dict[str, Any]:
@@ -454,7 +487,7 @@ async def gather_crypto_intelligence(
     budget = resolved_settings.MARKET_DATA_GROUP_BUDGET_SECONDS
 
     symbol = underlying_symbol or _infer_symbol(title)
-    strike, direction = _parse_strike_and_direction(title)
+    strike, direction = _parse_strike_and_direction(title, direction)
     if target_price is not None:
         strike = target_price
 
