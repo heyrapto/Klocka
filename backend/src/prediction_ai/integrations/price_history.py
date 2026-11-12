@@ -26,6 +26,7 @@ from prediction_ai.schemas.price_history import (
     MAX_HISTORY_POINTS,
     OutcomePriceHistory,
     PricePoint,
+    PriceSource,
 )
 
 logger = structlog.get_logger(__name__)
@@ -168,7 +169,11 @@ def order_book_to_price_histories(
 ) -> list[OutcomePriceHistory]:
     """Convert the observed decision-time book into persistable price points."""
     by_outcome = {quote.outcome_id: quote for quote in book.quotes}
-    source = f"{book.platform}_clob_snapshot"
+    source: PriceSource = (
+        "polymarket_clob_snapshot"
+        if book.platform == "polymarket"
+        else "bayse_clob_snapshot"
+    )
     histories: list[OutcomePriceHistory] = []
     for outcome in market.outcomes:
         quote = by_outcome.get(outcome.outcome_id)
@@ -190,7 +195,7 @@ def order_book_to_price_histories(
                         observed_at=book.observed_at,
                         price=midpoint,
                         kind="mid",
-                        source=source,  # type: ignore[arg-type]
+                        source=source,
                     )
                 ],
             )

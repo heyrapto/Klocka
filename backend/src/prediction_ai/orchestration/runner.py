@@ -20,6 +20,7 @@ from prediction_ai.integrations.bayse import BayseAdapter
 from prediction_ai.integrations.http import ProviderHttpClient
 from prediction_ai.integrations.network import build_resilient_client
 from prediction_ai.integrations.polymarket import PolymarketAdapter
+from prediction_ai.integrations.price_history import order_book_to_price_histories
 from prediction_ai.markets.contract_spec import build_contract_spec, resolve_contract_direction
 from prediction_ai.markets.matcher import match_candidate_to_platform_market
 from prediction_ai.markets.quote_mapping import find_outcome_quote as _find_outcome_quote
@@ -720,6 +721,29 @@ class AnalysisWorkflowRunner:
                 platform=best_market.platform,
                 market_id=best_market.platform_market_id,
                 error=type(_refresh_err).__name__,
+            )
+
+        # Persist the exact book used for this decision as point-in-time price
+        # history.  Polymarket can be backfilled from CLOB /prices-history, but
+        # Bayse publishes no documented historical endpoint, so these snapshots
+        # are the only non-fabricated forward price path for Bayse.  Capture is
+        # best-effort: a history write must never block or fail a forecast.
+        try:
+            price_histories = order_book_to_price_histories(best_market, order_book)
+            inserted_points = await sqlite.record_price_histories(price_histories)
+            logger.info(
+                "Persisted decision-time market price snapshot",
+                platform=best_market.platform,
+                market_id=best_market.platform_market_id,
+                outcomes=len(price_histories),
+                points_inserted=inserted_points,
+            )
+        except Exception as _history_err:
+            logger.warning(
+                "Decision-time price-history capture failed",
+                platform=best_market.platform,
+                market_id=best_market.platform_market_id,
+                error=type(_history_err).__name__,
             )
 
         # -------------------------------------------------------------

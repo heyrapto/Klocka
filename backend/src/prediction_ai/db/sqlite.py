@@ -2,6 +2,7 @@ import json
 import sqlite3
 import uuid
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -969,7 +970,12 @@ class SQLiteStore:
                 """,
                 params,
             )
-            return [dict(row) for row in cursor.fetchall()]
+            records: list[dict[str, Any]] = []
+            for row in cursor.fetchall():
+                record = dict(row)
+                record["price"] = Decimal(str(record["price"]))
+                records.append(record)
+            return records
 
     async def get_price_history(
         self,
@@ -982,14 +988,17 @@ class SQLiteStore:
         limit: int = 1000,
     ) -> list[dict[str, Any]]:
         """Return a bounded, ascending price path for one outcome."""
+        start_iso = start.isoformat() if start is not None else None
+        end_iso = end.isoformat() if end is not None else None
         return await anyio.to_thread.run_sync(
-            self._get_price_history_sync,
-            platform,
-            platform_market_id,
-            outcome_id,
-            start=start.isoformat() if start is not None else None,
-            end=end.isoformat() if end is not None else None,
-            limit=limit,
+            lambda: self._get_price_history_sync(
+                platform,
+                platform_market_id,
+                outcome_id,
+                start=start_iso,
+                end=end_iso,
+                limit=limit,
+            )
         )
 
     def _get_latest_price_before_sync(

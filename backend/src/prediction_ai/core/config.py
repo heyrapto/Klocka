@@ -165,7 +165,7 @@ class Settings(BaseSettings):
     # Bounds for provider price-history ingestion.  The CLOB endpoint returns
     # at most one point per fidelity minute, so a 5,000-point cap covers a
     # multi-day window without permitting unbounded responses.
-    PRICE_HISTORY_MAX_POINTS: int = Field(default=5000, ge=1, le=20_000)
+    PRICE_HISTORY_MAX_POINTS: int = Field(default=5000, ge=1, le=5000)
     PRICE_HISTORY_DEFAULT_FIDELITY_MINUTES: int = Field(default=1, ge=1, le=1440)
 
     # ------------------------------------------------------------------

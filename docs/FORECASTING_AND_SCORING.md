@@ -217,3 +217,15 @@ flowchart LR
 2. **Purging:** Training observations whose event resolution windows overlap with the start of the evaluation set are purged.
 3. **Embargoing:** An embargo window equal to the maximum forecast horizon (e.g., $1\text{ hour}$) is inserted between training and testing splits to eliminate autoregressive correlation leakage.
 4. **Holdout Invariance:** A 3-month rolling holdout dataset is frozen and never utilized during hyperparameter tuning.
+
+---
+
+## 8. Market-Relative Evaluation
+
+Brier and BSS are only meaningful when the market baseline comes from the same
+point in time as the forecast. Historical market prices are stored in
+`market_price_history`, Polymarket can be backfilled from CLOB
+`/prices-history`, and the closing-line report measures entry-market BSS plus
+CLV at settlement. See [`MARKET_PRICE_HISTORY.md`](MARKET_PRICE_HISTORY.md) for
+the schema, bounds, and CLI commands. A negative BSS is a model-review signal,
+not a reason to force a trade.
