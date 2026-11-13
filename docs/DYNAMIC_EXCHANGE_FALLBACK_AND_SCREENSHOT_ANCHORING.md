@@ -59,22 +59,27 @@ flowchart TD
 | **Gate.io** | `https://api.gateio.ws/api/v4` | Global Fallback | Spot, 15m/1h Candles, Depth, Funding Rate, 1m History |
 | **Bitstamp** | `https://www.bitstamp.net/api/v2` | Global Fallback | 1m OHLC history (settlement) |
 | **CoinGecko** | `https://api.coingecko.com/api/v3` | Global Fallback | Spot, Historical Point Prices |
-| **DefiLlama** | `https://coins.llama.fi` | Global Fallback | Spot (confidence-weighted) |
+| **DefiLlama** | `https://coins.llama.fi` | Global Fallback | Spot (confidence-weighted), Historical Point Prices |
+| **CryptoCompare** | `https://min-api.cryptocompare.com/data/v2` | Global Fallback | 1m Historical Candles |
+| **Pyth Network** | `https://benchmarks.pyth.network/v1/shims/tradingview` | Global Fallback | 1m Historical Benchmark Prices |
 | **Alternative.me** | `https://api.alternative.me/fng/` | Global Fallback | Fear & Greed Index |
 
 ### 2.2 Auto-Settlement Resolver
 
 `POST /api/v1/analyses/{analysis_id}/auto-settle` must never depend on a single exchange.
 
-1. **Historical path** (when `exact_resolves_at` is older than the live-fallback grace
-   window): race timestamp-validated 1m candles from Binance, Coinbase Exchange,
-   Kraken, MEXC, Gate.io, Binance US, Bitstamp, and CoinGecko. A candidate is accepted
-   only when its observation is within 120 seconds of the requested resolution time.
-2. **Live path** (when the target is absent, in the future, or within the 120-second
-   grace window): use the same cross-venue spot mesh as research and take its median.
-3. **No silent time travel:** if the target is materially historical and no validated
-   candle exists, the resolver returns `None` instead of substituting a much-later
-   live price. The API then returns HTTP 502 and preserves manual settlement.
+1. **Historical path** (whenever `exact_resolves_at` is in the past): race
+   timestamp-validated observations from DefiLlama, CryptoCompare, Pyth Network,
+   Bybit, OKX, Binance Global, Coinbase Exchange, Kraken, MEXC, Gate.io, Binance US,
+   Bitstamp, and CoinGecko. A candidate is accepted only when its observation is
+   within 300 seconds (±5 minutes) of the requested resolution time.
+2. **Live path** (when the target is absent, in the future, or within the 30-minute
+   live-fallback grace window but no validated historical observation exists): use
+   the same cross-venue spot mesh as research and take its median.
+3. **No silent time travel:** if the target is older than the 30-minute grace window
+   and no validated historical observation exists, the resolver returns `None`
+   instead of substituting a much-later live price. The API then returns HTTP 502
+   and preserves manual settlement.
 4. **No fabrication:** a price is never derived from the strike, and an open contract
    is never settled early.
 

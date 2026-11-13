@@ -924,6 +924,26 @@ class AnalysisWorkflowRunner:
                 "effective_uncertainty_margin": str(effective_uncertainty_margin),
                 "order_book_refreshed": order_book_refreshed,
             },
+            # The exact policy used for this decision.  A replay must not infer
+            # thresholds from today's configuration, which may have changed.
+            "decision_policy": {
+                "policy_version": self.settings.DECISION_POLICY_VERSION,
+                "min_edge": str(self.settings.DECISION_MIN_EDGE),
+                "uncertainty_margin": str(effective_uncertainty_margin),
+                "required_edge": str(
+                    Decimal(str(self.settings.DECISION_MIN_EDGE))
+                    + effective_uncertainty_margin
+                ),
+                "max_spread": str(self.settings.DECISION_MAX_SPREAD),
+                "max_quote_age_seconds": str(
+                    self.settings.DECISION_MAX_QUOTE_AGE_SECONDS
+                ),
+                "min_depth_usd": str(min_depth_usd),
+                "target_order_usd": str(target_order_usd),
+                "block_on_resolution_risk": strict_crypto,
+                "slippage_bps": self.settings.DECISION_SLIPPAGE_BPS,
+                "kelly_fraction": str(self.settings.DECISION_KELLY_FRACTION),
+            },
         }
         model_components = {
             "llm_probability": forecast_result.input_snapshot.get("llm_probability"),
@@ -967,6 +987,9 @@ class AnalysisWorkflowRunner:
                 "reasoning": forecast_result.reasoning,
                 "key_drivers": forecast_result.key_drivers,
                 "decision_reason": decision.reason,
+                # Persist the exact gate result so a later audit does not have
+                # to infer the abstention cause from prose.
+                "gating_flags": decision.gating_flags,
             },
             "evidence": [ev.model_dump(mode="json") for ev in forecast_result.evidence],
             "market": best_market.model_dump(mode="json"),

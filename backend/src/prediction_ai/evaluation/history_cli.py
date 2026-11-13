@@ -16,15 +16,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
-import logging
-import sys
 from pathlib import Path
-
-import structlog
 
 from prediction_ai.core.config import Settings, get_settings
 from prediction_ai.db.sqlite import SQLiteStore
+from prediction_ai.evaluation.cli_support import configure_cli_logging, emit_json
 from prediction_ai.evaluation.closing_line import (
     DEFAULT_MAX_PAGES,
     MAX_PAGE_SIZE,
@@ -163,37 +159,8 @@ async def _run_report(args: argparse.Namespace) -> dict[str, object]:
     return payload
 
 
-def _emit(payload: dict[str, object], output: str | None) -> None:
-    serialized = json.dumps(payload, indent=2, sort_keys=True, default=str)
-    if output:
-        Path(output).write_text(serialized + "\n", encoding="utf-8")
-    else:
-        sys.stdout.write(serialized + "\n")
-    if output:
-        sys.stderr.write(serialized + "\n")
-
-
-def _configure_cli_logging() -> None:
-    """Keep JSON/stdout clean by routing structured logs to stderr."""
-    logging.basicConfig(
-        format="%(message)s",
-        stream=sys.stderr,
-        level=logging.INFO,
-        force=True,
-    )
-    structlog.configure(
-        processors=[
-            structlog.processors.add_log_level,
-            structlog.processors.TimeStamper(fmt="iso", utc=True),
-            structlog.dev.ConsoleRenderer(colors=False),
-        ],
-        logger_factory=structlog.PrintLoggerFactory(file=sys.stderr),
-        cache_logger_on_first_use=False,
-    )
-
-
 def main(argv: list[str] | None = None) -> int:
-    _configure_cli_logging()
+    configure_cli_logging()
     parser = build_parser()
     args = parser.parse_args(argv)
     _validate_bounds(parser, args)
@@ -217,7 +184,7 @@ def main(argv: list[str] | None = None) -> int:
     except FileNotFoundError as exc:
         parser.error(str(exc))
 
-    _emit(payload, args.output)
+    emit_json(payload, args.output)
     return 0
 
 
